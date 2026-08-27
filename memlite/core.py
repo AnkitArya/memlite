@@ -95,9 +95,11 @@ class Memory:
         run_id=None,
         metadata=None,
         infer=True,
+        memory_type="world_fact",
     ):
         """Create memory/memories. mirrors mem0.
-        messages: str | dict | list[dict]. infer=True uses the LLM to extract."""
+        messages: str | dict | list[dict]. infer=True uses the LLM to extract.
+        memory_type: 'world_fact' (default) or 'experience' (hindsight-inspired)."""
         texts = self._to_texts(messages)
         if not texts:
             return {"results": []}
@@ -111,7 +113,7 @@ class Memory:
             emb = self.embedder.embed(mem)
             mid = self._store_get().insert(
                 mem, emb, user_id=user_id, agent_id=agent_id,
-                run_id=run_id, metadata=metadata,
+                run_id=run_id, metadata=metadata, memory_type=memory_type,
             )
             results.append({"id": mid, "memory": mem, "event": "ADD"})
         return {"results": results}
@@ -174,6 +176,36 @@ class Memory:
         sorted_items = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
         return sorted_items[:top_k]
 
+    # ---------- reflect (hindsight-inspired synthesis) ----------
+    def reflect(self, query: str, *, filters: dict | None = None, top_k: int = 5):
+        """Synthesize an answer from the recalled memories (Hindsight's 'reflect').
+
+        Retrieves the top memories, then has the LLM compose a grounded, disposition-
+        aware answer from them. Falls back to returning the raw hits if no LLM is
+        configured or the call fails — reflect never blocks recall.
+        """
+        hits = self.search(query, filters=filters, top_k=top_k, strategy="hybrid")
+        if not hits or self._llm_client is None:
+            return {"answer": None, "memories": hits, "synthesized": False}
+
+        evidence = "\n".join(f"- {h['memory']}" for h in hits)
+        prompt = (
+            "You are an assistant answering a question from the user's stored memories.\n"
+            "Use ONLY the evidence below; if it does not answer the question, say so.\n\n"
+            f"Question: {query}\n\nRelevant memories:\n{evidence}\n\n"
+            "Answer concisely in 1-3 sentences, grounded strictly in the evidence."
+        )
+        try:
+            r = self._llm_client.chat.completions.create(
+                model=self._llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+            answer = r.choices[0].message.content.strip()
+            return {"answer": answer, "memories": hits, "synthesized": True}
+        except Exception:
+            return {"answer": None, "memories": hits, "synthesized": False}
+
     @staticmethod
     def _shape(row: dict, source: str) -> dict:
         score = row.get("score")
@@ -183,6 +215,7 @@ class Memory:
         return {
             "id": row["id"],
             "memory": row["memory"],
+            "memory_type": row.get("memory_type", "world_fact"),
             "score": float(score) if score is not None else 0.0,
             "metadata": row.get("metadata") or {},
             "user_id": row.get("user_id"),

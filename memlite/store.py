@@ -23,13 +23,14 @@ CREATE TABLE IF NOT EXISTS memories (
     agent_id   TEXT,
     run_id     TEXT,
     memory     TEXT NOT NULL,
+    memory_type TEXT DEFAULT 'world_fact',   -- 'world_fact' | 'experience' (hindsight-inspired)
     metadata   TEXT,            -- JSON dict
     embed      TEXT NOT NULL,   -- JSON list of floats (kept inline for self-containment)
     created_at TEXT,
     updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_scope
-    ON memories(user_id, agent_id, run_id);
+    ON memories(user_id, agent_id, run_id, memory_type);
 """
 
 _SCHEMA_VEC = """
@@ -94,6 +95,7 @@ class Store:
         run_id: str | None = None,
         metadata: dict | None = None,
         memory_id: str | None = None,
+        memory_type: str = "world_fact",
     ) -> str:
         mid = memory_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -102,11 +104,11 @@ class Store:
             cur = self.conn.cursor()
             cur.execute(
                 """INSERT INTO memories
-                   (mem_id, user_id, agent_id, run_id, memory, metadata, embed,
-                    created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (mem_id, user_id, agent_id, run_id, memory, memory_type,
+                    metadata, embed, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    mid, user_id, agent_id, run_id, memory,
+                    mid, user_id, agent_id, run_id, memory, memory_type,
                     json.dumps(metadata or {}), json.dumps(embedding),
                     now, now,
                 ),
@@ -187,11 +189,11 @@ class Store:
         return self._row_to_dict(row) if row else None
 
     def list_all(self, filters: dict | None = None, limit: int | None = None) -> list[dict]:
-        sql = """SELECT m.mem_id AS id, m.memory, m.user_id, m.agent_id, m.run_id,
-                        m.metadata, m.created_at, m.updated_at
+        sql = """SELECT m.mem_id AS id, m.memory, m.memory_type, m.user_id, m.agent_id,
+                        m.run_id, m.metadata, m.created_at, m.updated_at
                  FROM memories m WHERE 1=1"""
         args = []
-        for key in ("user_id", "agent_id", "run_id"):
+        for key in ("user_id", "agent_id", "run_id", "memory_type"):
             v = filters.get(key) if filters else None
             if v is not None:
                 sql += f" AND {key}=?"
@@ -212,7 +214,7 @@ class Store:
         sql = """
             SELECT m.mem_id AS id,
                    (1 - knn.distance) AS score,
-                   m.memory,
+                   m.memory, m.memory_type,
                    m.user_id, m.agent_id, m.run_id, m.metadata,
                    m.created_at, m.updated_at
             FROM (
@@ -226,7 +228,7 @@ class Store:
         """
         # over-fetch so post-filtering still yields top_k per scope
         args = [blob, top_k * 10]
-        for key in ("user_id", "agent_id", "run_id"):
+        for key in ("user_id", "agent_id", "run_id", "memory_type"):
             v = filters.get(key) if filters else None
             if v is not None:
                 sql += f" AND m.{key}=?"
@@ -244,14 +246,14 @@ class Store:
         match_expr = " AND ".join(f'"{t}"' for t in terms)
         sql = """
             SELECT m.mem_id AS id, memories_fts.rank AS score,
-                   m.memory, m.user_id, m.agent_id, m.run_id, m.metadata,
+                   m.memory, m.memory_type, m.user_id, m.agent_id, m.run_id, m.metadata,
                    m.created_at, m.updated_at
             FROM memories_fts
             JOIN memories m ON m.id = memories_fts.rowid
             WHERE memories_fts MATCH ?
         """
         args = [match_expr]
-        for key in ("user_id", "agent_id", "run_id"):
+        for key in ("user_id", "agent_id", "run_id", "memory_type"):
             v = filters.get(key) if filters else None
             if v is not None:
                 sql += f" AND m.{key}=?"

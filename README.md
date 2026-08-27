@@ -60,6 +60,34 @@ m.delete(memory_id=hits[0]["id"])
 extract discrete facts — the same ADD-style extraction mem0 does. `infer=False`
 stores the raw text chunk directly and needs no LLM.
 
+### Hindsight-inspired additions
+
+Two light features borrowed from [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)'s
+retain / recall / reflect model (mem0 doesn't have these):
+
+- **`memory_type`** — tag a memory as `"world_fact"` (default) or `"experience"`,
+  and filter on it in `search` / `get_all`:
+  ```python
+  m.add("The sky is blue on clear days", user_id="sam", memory_type="world_fact")
+  m.add("I visited the Taj Mahal last Tuesday", user_id="sam", memory_type="experience")
+  m.get_all(filters={"user_id": "sam", "memory_type": "experience"})
+  ```
+- **`reflect(query)`** — recall the top memories, then have the LLM compose a
+  grounded, disposition-aware answer (a synthesis pass beyond raw recall):
+  ```python
+  r = m.reflect("where did the user travel recently?", filters={"user_id": "sam"})
+  # {"answer": "The user recently traveled to the Taj Mahal last Tuesday.",
+  #  "memories": [...hits...], "synthesized": True}
+  ```
+  `reflect` never blocks recall — if no LLM is configured or the call fails it
+  returns `{"synthesized": False, "memories": hits}`.
+
+> Why not port more of hindsight? Its embedded mode uses a closed `pg0://` binary
+> engine (not sqlite-vec) and its core value (biomimetic memory types, entity
+> graphs, mental models, consolidation) is exactly the heavyweight machinery this
+> lean store deliberately omits. `memory_type` + `reflect` capture most of the
+> user-facing value at negligible complexity.
+
 ## Config knobs
 
 - `embedder.config.model` — any OpenAI-compatible embeddings model

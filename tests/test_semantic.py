@@ -119,9 +119,49 @@ def test_infer_false_raw_chunks():
     print("\nRaw add + search OK:", sr[0]["memory"])
 
 
+def test_memory_type_and_reflect():
+    import tempfile
+
+    db = tempfile.mktemp(suffix=".db")
+    m = Memory(
+        {
+            "llm": {"config": {"model": "deepseek-ai/DeepSeek-V3"}},
+            "embedder": {"config": {"model": "BAAI/bge-base-en-v1.5",
+                                    "openai_base_url": "https://api.deepinfra.com/v1/openai"}},
+        },
+        db_path=db,
+    )
+    m.add("The sky is blue on clear days", user_id="sam", infer=False, memory_type="world_fact")
+    m.add("I visited the Taj Mahal last Tuesday", user_id="sam", infer=False, memory_type="experience")
+
+    # memory_type filtering
+    gg = m.get_all(filters={"user_id": "sam", "memory_type": "experience"})
+    kinds = {x["memory_type"] for x in gg["results"]}
+    assert kinds == {"experience"}, kinds
+    assert all("Taj" in x["memory"] for x in gg["results"])
+
+    # memory_type surfaces in search results
+    sem = m.search("what type is the memory about the taj", filters={"user_id": "sam"})
+    print("\nSearch results carry memory_type:")
+    for r in sem:
+        print(f"  [{r['memory_type']}] {r['memory']}")
+    assert all("memory_type" in r for r in sem)
+
+    # reflect synthesizes (needs the LLM configured; DeepInfra chat works live)
+    ref = m.reflect("where did the user travel recently?", filters={"user_id": "sam"})
+    print("reflect synthesized:", ref["synthesized"])
+    if ref["synthesized"]:
+        print("  answer:", ref["answer"])
+        assert ref["answer"], "reflect returned empty answer"
+    else:
+        print("  (LLM unavailable; reflect returned raw memories — acceptable)")
+    m.close()
+
+
 if __name__ == "__main__":
     test_semantic_search_returns_relevant_memories()
     test_keyword_fallback()
     test_hybrid_and_roundtrip()
     test_infer_false_raw_chunks()
+    test_memory_type_and_reflect()
     print("\nALL TESTS PASSED")
