@@ -36,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_scope
 _SCHEMA_VEC = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors
 USING vec0(
-    embedding float[{dims}]
+    embedding float[{dims}] distance_metric={distance}
 );
 """
 
@@ -79,10 +79,35 @@ class Store:
         with self._lock:
             cur = self.conn.cursor()
             cur.executescript(_SCHEMA_MEMORIES)
-            cur.executescript(_SCHEMA_VEC.format(dims=self.dims))
+            self._ensure_vec_table(cur)
             cur.executescript(_SCHEMA_FTS)
             cur.executescript(_SCHEMA_HISTORY)
             self.conn.commit()
+
+    def _ensure_vec_table(self, cur):
+        """Create the vec0 table, or rebuild it if a legacy copy used L2.
+
+        Databases created before distance_metric was wired up silently scored
+        with (1 - L2), which is not cosine similarity and broke reconcile
+        thresholds. Embeddings live inline in memories.embed, so the rebuild is
+        a cheap one-time copy — no re-embedding, no data loss.
+        """
+        row = cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vectors'"
+        ).fetchone()
+        if row is not None and "distance_metric=cosine" in (row["sql"] or ""):
+            return  # current schema, nothing to do
+        if row is not None:
+            rows = cur.execute("SELECT id, embed FROM memories").fetchall()
+            cur.execute("DROP TABLE memory_vectors")
+            cur.executescript(_SCHEMA_VEC.format(dims=self.dims, distance=_DISTANCE))
+            for r in rows:
+                cur.execute(
+                    "INSERT INTO memory_vectors(rowid, embedding) VALUES (?, ?)",
+                    (r["id"], sqlite_vec.serialize_float32(json.loads(r["embed"]))),
+                )
+        else:
+            cur.executescript(_SCHEMA_VEC.format(dims=self.dims, distance=_DISTANCE))
 
     # ---------- writes ----------
     def insert(

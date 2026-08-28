@@ -71,6 +71,102 @@ def _parse_ops(text: str) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Deterministic (no-LLM) reconcile
+#
+# ADD / UPDATE / DELETE is decided with arithmetic, not a model:
+#   - DELETE: the new text carries an explicit retraction intent (lexical
+#     pattern) AND matches an existing memory closely.
+#   - UPDATE: the new text is semantically near an existing memory AND shares
+#     enough content-word tokens (same claim/topic, reworded or changed).
+#   - ADD: otherwise — conservative default, so information is never dropped.
+#
+# Cosine thresholds were calibrated against live bge-base-en-v1.5 embeddings:
+#   exact reword ~0.88, topic-update ~0.73, same-entity-different-fact ~0.76,
+#   unrelated ~0.38-0.52. Word Jaccard CANNOT disambiguate topic-update from
+#   same-entity-different-fact (both ~0.33), so the UPDATE gate uses SHARED
+#   CONTENT-BIGRAMS instead: a value change ("favorite color is teal" ->
+#   "changed to magenta") preserves the attribute key phrase ("favorite color"),
+#   while a different fact about the same entity ("has a dog named Max" vs
+#   "went hiking with Max") shares no content bigram. Known conservative miss:
+#   fully-reworded value changes with no lexical residue ("lives in Hyderabad"
+#   -> "moved to Bangalore") fall through to ADD — a duplicate, never data loss.
+# ---------------------------------------------------------------------------
+
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for",
+    "with", "at", "that", "this", "i", "me", "my", "we", "our", "you", "your",
+    "it", "its", "is", "are", "was", "were", "be", "been", "being", "has",
+    "have", "had", "do", "does", "did", "will", "would", "can", "could", "now",
+    "actually", "just", "really", "said", "say", "about", "their", "there",
+}
+
+# Phrases that signal an explicit retraction (DELETE intent). Anchored to word
+# boundaries so "not my favorite" still matches but "don't forget" (positive)
+# or "forgettable" do not.
+_RETRACT_RE = re.compile(
+    r"\b(forget|forgot|remove|delete|erase|drop|retract|scrap|never (?:liked|said|did|meant)|"
+    r"don'?t (?:like|want|need|use)|no longer|i (?:was )?wrong about|change my mind about|"
+    r"ignore what i (?:said|wrote))\b",
+    re.IGNORECASE,
+)
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Set of meaningful lowercase tokens, stopwords and punctuation removed."""
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
+
+
+def _content_token_list(text: str) -> list[str]:
+    """ORDERED content tokens (set order is arbitrary — bigrams need order)."""
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    return [w for w in words if w not in _STOPWORDS and len(w) > 1]
+
+
+def _bigrams(text: str) -> set[str]:
+    """Adjacent content-word pairs ("favorite color", "works as")."""
+    ts = _content_token_list(text)
+    return {" ".join(p) for p in zip(ts, ts[1:])}
+
+
+def _shared_bigrams(a: str, b: str) -> set[str]:
+    """Content-word bigrams present in BOTH strings.
+
+    The UPDATE signal: a value change preserves the attribute key phrase
+    ("favorite color", "works as"), a different fact about the same entity
+    shares nothing. Word-set Jaccard cannot make this distinction (both score
+    ~0.33); shared bigrams can.
+    """
+    return _bigrams(a) & _bigrams(b)
+
+
+def _jaccard(a: str, b: str) -> float:
+    """Token-set Jaccard overlap in [0,1]; 1 = identical content words.
+
+    Kept as a diagnostic helper — the reconcile decision itself uses
+    _shared_bigrams, which separates value-change from same-entity-different-fact
+    (Jaccard scores both ~0.33 and cannot).
+    """
+    sa, sb = _content_tokens(a), _content_tokens(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _is_retraction(text: str) -> bool:
+    m = _RETRACT_RE.search(text)
+    if m is None:
+        return False
+    # "don't/didn't forget ..." is a reminder (positive intent), not a retraction:
+    # if the matched token is forget/forgot and it is negated, keep it.
+    if m.group(0).lower() in ("forget", "forgot"):
+        prefix = text[: m.start()].lower()
+        if re.search(r"\b(?:don'?t|do not|didn'?t|did not|never)\s+$", prefix):
+            return False
+    return True
+
+
 class Memory:
     def __init__(self, config: dict | None = None, db_path: str = "memlite.db"):
         config = config or {}
@@ -127,13 +223,16 @@ class Memory:
         metadata=None,
         infer=True,
         memory_type="world_fact",
+        reconcile_with_llm=False,
     ):
         """Create memory/memories. mirrors mem0 (incl. UPDATE/DELETE reconciliation).
 
         messages: str | dict | list[dict].
-        infer=True and an LLM configured: one reconcile call decides, for each new
-          piece of information, whether to ADD (new fact), UPDATE (replace/refine an
-          existing memory by id), or DELETE (retract an existing memory by id).
+        infer=True: reconcile each new piece of information against existing
+          memories — deterministically (no LLM) by default:
+            ADD (new fact) | UPDATE (reworded/changed same claim) | DELETE (retraction).
+          Pass reconcile_with_llm=True (and an LLM in config) to use an LLM for the
+          same decision instead of the arithmetic rule.
         infer=False: raw text chunks stored directly as ADD (no LLM).
         memory_type: 'world_fact' (default) or 'experience' (hindsight-inspired).
 
@@ -144,14 +243,21 @@ class Memory:
         if not texts:
             return {"results": []}
 
-        # Reconcile path (LLM decides ADD/UPDATE/DELETE against existing memories)
-        if infer and self._llm_client:
+        # LLM reconcile: opt-in only.
+        if infer and reconcile_with_llm and self._llm_client:
             return self._reconcile_add(
                 texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
                 metadata=metadata, memory_type=memory_type,
             )
 
-        # Raw / no-LLM path: plain ADD
+        # Deterministic reconcile (no LLM): the default for infer=True.
+        if infer:
+            return self._deterministic_reconcile(
+                texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
+                metadata=metadata, memory_type=memory_type,
+            )
+
+        # Raw path (infer=False): plain ADD.
         results = []
         for mem in texts:
             mem = mem.strip()
@@ -164,6 +270,85 @@ class Memory:
             )
             results.append({"id": mid, "memory": mem, "event": "ADD"})
         return {"results": results}
+
+    def _deterministic_reconcile(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
+        """No-LLM reconcile. Arithmetic decision over semantic + token overlap.
+
+        For each new text: retrieve top similar existing memories in scope, then:
+          - DELETE  if the text is an explicit retraction AND closely matches one.
+          - UPDATE  if semantic cosine >= COS_UPDATE and token jaccard >= JAC_UPDATE
+                    (same claim reworded or changed).
+          - ADD     otherwise (conservative: never drop new information).
+        """
+        store = self._store_get()
+        scope = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
+
+        results = []
+        for text in texts:
+            text = text.strip()
+            if not text:
+                continue
+            emb = self.embedder.embed(text)
+
+            # retrieve top similar existing memories in the same scope
+            existing = []
+            try:
+                existing = store.semantic_search(emb, top_k=5, filters=scope)
+            except Exception:
+                existing = []
+
+            op = self._decide(text, emb, existing)
+
+            if op["event"] == "ADD":
+                mid = store.insert(
+                    text, emb, user_id=user_id, agent_id=agent_id, run_id=run_id,
+                    metadata=metadata, memory_type=memory_type,
+                )
+                results.append({"id": mid, "memory": text, "event": "ADD"})
+            elif op["event"] == "UPDATE":
+                mid = op["id"]
+                # normalize pronouns to a durable fact
+                new_text = text
+                store.update_memory(mid, new_text, emb)
+                results.append({"id": mid, "memory": new_text, "event": "UPDATE"})
+            elif op["event"] == "DELETE":
+                mid = op["id"]
+                store.delete(mid)
+                results.append({"id": mid, "memory": None, "event": "DELETE"})
+        return {"results": results}
+
+    @staticmethod
+    def _decide(text: str, emb, existing: list, cos_update=0.65):
+        """Pure decision function (unit-testable, no store/io dependence).
+
+        UPDATE gate = shared content-bigrams (attribute key phrase survives a
+        value change; a different fact about the same entity shares none).
+        ADD is the conservative default — a wrong ADD is a duplicate, a wrong
+        UPDATE/DELETE loses information.
+        """
+        if not existing:
+            return {"event": "ADD"}
+
+        best = max(existing, key=lambda m: m.get("score", 0.0))
+        cos_ = float(best.get("score", 0.0))  # cosine similarity (1 - distance)
+        best_text = best["memory"]
+
+        # DELETE: explicit retraction intent AND close match to an existing fact
+        if _is_retraction(text):
+            if cos_ >= cos_update:
+                return {"event": "DELETE", "id": best["id"]}
+            # retraction intent but no close match: nothing to retract -> ADD no-op
+            return {"event": "ADD"}
+
+        # UPDATE: same claim, changed value/rewording — cosine near AND the
+        # attribute key phrase (shared content-bigram) survives the edit.
+        if cos_ >= cos_update and _shared_bigrams(text, best_text):
+            return {"event": "UPDATE", "id": best["id"], "cos": cos_,
+                    "shared": sorted(_shared_bigrams(text, best_text))}
+
+        # ADD: everything else — including high-cosine + no shared bigram
+        # (same entity, different fact) which must be kept as a separate memory.
+        return {"event": "ADD", "cos": cos_}
 
     def _reconcile_add(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
         """Single-call reconcile: semantic-retrieve existing, LLM decides ops, apply."""

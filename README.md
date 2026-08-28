@@ -56,24 +56,35 @@ m.update("User loves spicy Thai food", memory_id=hits[0]["id"])
 m.delete(memory_id=hits[0]["id"])
 ```
 
-`infer=True` (default) sends the raw text to an LLM to extract discrete facts and
-**reconcile them against existing memories** — the same ADD / UPDATE / DELETE
-behavior mem0 has. `infer=False` stores the raw text chunk directly and needs no LLM.
+`infer=True` (default) reconciles each new piece of information against existing
+memories **deterministically — with arithmetic, no LLM call**: retrieve the
+top semantically similar memories in scope, then decide
+
+- **DELETE** — the text carries explicit retraction intent ("forget X", "no
+  longer ...") *and* closely matches an existing memory (cosine ≥ 0.65)
+- **UPDATE** — cosine ≥ 0.65 **and** the pair shares a content-word bigram
+  (the attribute key phrase — "favorite color", "works as" — survives a value
+  change, while a *different* fact about the same entity shares none)
+- **ADD** — everything else. Conservative default: a wrong ADD is a duplicate,
+  a wrong UPDATE/DELETE loses information. Known conservative miss: a value
+  change with *no* lexical residue ("lives in Hyderabad" → "moved to
+  Bangalore") stores as a duplicate ADD rather than an in-place update.
 
 ```python
 m.add("My favorite color is teal", user_id="alice", infer=False)
 m.add("Actually, my favorite color changed to magenta now", user_id="alice", infer=True)
-# → [{"id": "<teal-id>", "memory": "User's favorite color is magenta", "event": "UPDATE"}]
-#   the teal memory is updated in place (same id), not duplicated
+# → [{"id": "<teal-id>", "memory": "...magenta...", "event": "UPDATE"}]
 
 m.add("Forget that I said I love pineapple on pizza", user_id="alice")
-# → [{"id": "<pineapple-id>", "memory": None, "event": "DELETE"}]  (memory removed)
+# → [{"id": "<pineapple-id>", "memory": None, "event": "DELETE"}]
 ```
 
-The reconcile pass is **one LLM call**: semantically retrieve existing memories in
-the same scope, let the LLM emit `ADD` / `UPDATE` / `DELETE` operations, then apply
-them transactionally. If the LLM is unavailable or returns nothing usable, `add`
-falls back to a plain `ADD` of the raw text — it never silently drops information.
+Pass `reconcile_with_llm=True` (with an LLM in config) to hand the same
+ADD/UPDATE/DELETE decision to an LLM instead of the arithmetic rule — useful
+for retraction-heavy or heavily-reworded workloads where the lexical gate is
+too conservative. If the LLM is unavailable or returns nothing usable, `add`
+falls back to a plain `ADD` of the raw text — it never silently drops
+information.
 
 ### Hindsight-inspired additions
 
