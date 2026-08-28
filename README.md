@@ -56,9 +56,24 @@ m.update("User loves spicy Thai food", memory_id=hits[0]["id"])
 m.delete(memory_id=hits[0]["id"])
 ```
 
-`infer=True` (default) sends the raw text to an LLM (DeepInfra chat model) to
-extract discrete facts — the same ADD-style extraction mem0 does. `infer=False`
-stores the raw text chunk directly and needs no LLM.
+`infer=True` (default) sends the raw text to an LLM to extract discrete facts and
+**reconcile them against existing memories** — the same ADD / UPDATE / DELETE
+behavior mem0 has. `infer=False` stores the raw text chunk directly and needs no LLM.
+
+```python
+m.add("My favorite color is teal", user_id="alice", infer=False)
+m.add("Actually, my favorite color changed to magenta now", user_id="alice", infer=True)
+# → [{"id": "<teal-id>", "memory": "User's favorite color is magenta", "event": "UPDATE"}]
+#   the teal memory is updated in place (same id), not duplicated
+
+m.add("Forget that I said I love pineapple on pizza", user_id="alice")
+# → [{"id": "<pineapple-id>", "memory": None, "event": "DELETE"}]  (memory removed)
+```
+
+The reconcile pass is **one LLM call**: semantically retrieve existing memories in
+the same scope, let the LLM emit `ADD` / `UPDATE` / `DELETE` operations, then apply
+them transactionally. If the LLM is unavailable or returns nothing usable, `add`
+falls back to a plain `ADD` of the raw text — it never silently drops information.
 
 ### Hindsight-inspired additions
 
@@ -108,10 +123,13 @@ retain / recall / reflect model (mem0 doesn't have these):
 ## Scope & honesty
 
 This is an independent, ground-up implementation of mem0's public API surface,
-not a fork of mem0's internals. It deliberately does **not** include mem0's
-entity linking, temporal reasoning, multi-signal fusion, or graph store — those
-are the heavy parts. If your recall needs the production-grade ranking, use mem0.
-If you need cheap, single-file, no-vector-server semantic memory, this is it.
+not a fork of mem0's internals. It now covers mem0's core **reconcile** behavior
+(ADD / UPDATE / DELETE on `add`), plus semantic + keyword + hybrid recall. It
+still deliberately omits mem0's **entity graph / cross-memory relations,
+temporal reasoning, procedural-memory pathway, vision, and cross-encoder
+reranking** — those are the heavy parts. If your recall needs the full
+production-grade ranking, use mem0. If you need cheap, single-file,
+no-vector-server semantic memory with real conflict resolution, this is it.
 
 ## License
 

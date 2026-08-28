@@ -158,10 +158,51 @@ def test_memory_type_and_reflect():
     m.close()
 
 
+def test_reconcile_update_delete():
+    import tempfile
+
+    db = tempfile.mktemp(suffix=".db")
+    m = Memory(
+        {"llm": {"config": {"model": "deepseek-ai/DeepSeek-V3"}},
+         "embedder": {"config": {"model": "BAAI/bge-base-en-v1.5",
+                                 "openai_base_url": "https://api.deepinfra.com/v1/openai"}}},
+        db_path=db,
+    )
+
+    # seed a fact (raw add, no LLM)
+    seed = m.add("My favorite color is teal", user_id="recon", infer=False)
+    seed_id = seed["results"][0]["id"]
+
+    # UPDATE: user changes their mind; infer=True + LLM should reconcile
+    upd = m.add("Actually, my favorite color changed to magenta now",
+                user_id="recon")
+    events = {r["event"] for r in upd["results"]}
+    print("\nReconcile UPDATE events:", events, [r["memory"] for r in upd["results"] if r["event"] != "DELETE"])
+    assert "UPDATE" in events, f"expected an UPDATE, got events={events}"
+    # the teal memory should now read magenta (updated in place)
+    after = m.get_all(filters={"user_id": "recon"})
+    non_deleted = [x for x in after["results"]]
+    assert any("magenta" in x["memory"] for x in non_deleted), non_deleted
+    remain_ids = {x["id"] for x in non_deleted}
+    assert seed_id in remain_ids, "UPDATE should keep the same memory id"
+
+    # DELETE: user retracts another fact
+    m.add("I love pineapple on pizza", user_id="recon", infer=False)
+    dl = m.add("Forget that I said I love pineapple on pizza", user_id="recon")
+    dl_events = {r["event"] for r in dl["results"]}
+    print("Reconcile DELETE events:", dl_events)
+    assert "DELETE" in dl_events, f"expected a DELETE, got events={dl_events}"
+    final = m.get_all(filters={"user_id": "recon"})
+    assert not any("pineapple" in x["memory"].lower() for x in final["results"]), \
+        "deleted memory should be gone"
+    m.close()
+
+
 if __name__ == "__main__":
     test_semantic_search_returns_relevant_memories()
     test_keyword_fallback()
     test_hybrid_and_roundtrip()
     test_infer_false_raw_chunks()
     test_memory_type_and_reflect()
+    test_reconcile_update_delete()
     print("\nALL TESTS PASSED")

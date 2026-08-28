@@ -42,7 +42,7 @@ USING vec0(
 
 _SCHEMA_FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-USING fts5(memory, content='memories', content_rowid='id');
+USING fts5(id UNINDEXED, memory);
 """
 
 _SCHEMA_HISTORY = """
@@ -120,8 +120,8 @@ class Store:
                 (row_id, vec_blob),
             )
             cur.execute(
-                "INSERT INTO memories_fts(rowid, memory) VALUES (?, ?)",
-                (row_id, memory),
+                "INSERT INTO memories_fts(id, memory) VALUES (?, ?)",
+                (mid, memory),
             )
             cur.execute(
                 "INSERT INTO history(id, memory_id, old_memory, new_memory, event, created_at)"
@@ -149,11 +149,11 @@ class Store:
                 "UPDATE memory_vectors SET embedding=? WHERE rowid=?",
                 (self._vector_to_blob(embedding), row_id),
             )
-            # FTS: delete + reinsert rowid
-            cur.execute("DELETE FROM memories_fts WHERE rowid=?", (row_id,))
+            # FTS: delete + reinsert by id (standalone fts5 table)
+            cur.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
             cur.execute(
-                "INSERT INTO memories_fts(rowid, memory) VALUES (?,?)",
-                (row_id, memory),
+                "INSERT INTO memories_fts(id, memory) VALUES (?,?)",
+                (memory_id, memory),
             )
             cur.execute(
                 "INSERT INTO history(id, memory_id, old_memory, new_memory, event, created_at)"
@@ -172,7 +172,7 @@ class Store:
             row_id = r["id"]
             cur.execute("DELETE FROM memories WHERE mem_id=?", (memory_id,))
             cur.execute("DELETE FROM memory_vectors WHERE rowid=?", (row_id,))
-            cur.execute("DELETE FROM memories_fts WHERE rowid=?", (row_id,))
+            cur.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
             now = datetime.now(timezone.utc).isoformat()
             cur.execute(
                 "INSERT INTO history(id, memory_id, event, created_at) VALUES (?,?,?,?)",
@@ -249,7 +249,7 @@ class Store:
                    m.memory, m.memory_type, m.user_id, m.agent_id, m.run_id, m.metadata,
                    m.created_at, m.updated_at
             FROM memories_fts
-            JOIN memories m ON m.id = memories_fts.rowid
+            JOIN memories m ON m.mem_id = memories_fts.id
             WHERE memories_fts MATCH ?
         """
         args = [match_expr]
