@@ -1,18 +1,29 @@
 # MemLite — Single UML Sequence Diagram (current flow)
 
-> One diagram, all cases. This is the authoritative flow reference —
-> `docs/flows.md` and `docs/reconcile_flow.mmd` were consolidated here.
+> One diagram, all cases. Validated renders via mermaid.ink. Thresholds
+> calibrated on live bge-base-en-v1.5 embeddings.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as Caller / App
+    participant HV as Hermes MemLiteProvider
     participant M as Memory (core.py)
     participant L as LLM (extraction only)
     participant E as Embedder (OpenAI-compatible, batched)
     participant S as Store (SQLite: memories + vec0 + FTS5 + history)
-    participant HV as Hermes MemLiteProvider
     participant P2 as Other Process
+
+    %% ==================== HERMES LIFECYCLE (WRAPPER) ====================
+    rect rgb(240,245,255)
+    note over C,HV: Hermes lifecycle adapter (plugins/memory/memlite)
+    C->>HV: prefetch()
+    Note over HV: drain prefetch cache (0ms, no network)
+    HV-->>C: <relevant_user_memories> (if cache non-empty)
+    C->>HV: sync_turn(user_msg, assistant_msg)
+    Note over HV: spawns daemon thread, non-blocking, primary context only
+    HV-->>M: add(messages) in worker (async)
+    end
 
     %% ==================== WRITE: add() ====================
     rect rgb(235,244,255)
@@ -30,24 +41,26 @@ sequenceDiagram
         end
         Note over M: retraction statements kept verbatim (DELETE intent preserved)
 
-        Note over M,E: BEGIN IMMEDIATE — all mutations below share ONE commit
+        %% Phase 1: planning — network I/O + reads, NO write lock held
         M->>E: embed_many(facts)   [one batched API call]
+        E-->>M: embeddings[]
         loop per extracted fact
-            M->>S: semantic_search(emb, top_k, scope filter)
+            M->>S: semantic_search(emb, top_k, scope filter)  [read-only]
             Note over S: adaptive widening: kNN scan x8 up to k=4096<br/>if scope filter discards everything
             S-->>M: existing candidates in scope
             M->>M: _decide(fact, emb, existing)
             alt DELETE: retraction intent AND cos >= 0.72
-                M->>S: delete(id, in_txn) + history[DELETE, old_memory snapshot]
-                M-->>C: event DELETE
+                Note over M: queue op: DELETE(id) + old_memory snapshot
             else UPDATE: (cos >= 0.65 AND shared content-bigram) OR cos >= 0.90
-                M->>S: update_memory(id, text, emb, in_txn) + history[UPDATE]
-                M-->>C: event UPDATE (same id — refresh/rewrite in place)
+                Note over M: queue op: UPDATE(id, text, emb)
             else ADD: everything else (conservative default)
-                M->>S: insert(text, emb, in_txn) + history[ADD]
-                M-->>C: event ADD
+                Note over M: queue op: INSERT(text, emb)
             end
         end
+
+        %% Phase 2: mutation — atomic write transaction, minimal lock hold
+        M->>S: BEGIN IMMEDIATE
+        M->>S: apply queued mutations (memories + vec0 + FTS5 + history)
         M->>S: COMMIT (single fsync)
         M-->>C: {results: [{id, memory, event}]}
     end
@@ -56,8 +69,9 @@ sequenceDiagram
     %% ==================== READ: search() ====================
     rect rgb(240,255,240)
     note over C,E: search(query, strategy, filters) — no LLM needed
-    C->>M: search(query)
+    C->>M: search(query, strategy, filters)
     M->>E: embed(query)
+    E-->>M: query_emb
     alt strategy semantic (default)
         M->>S: vec0 cosine kNN + scope join/filter
         S-->>M: raw rows
@@ -69,8 +83,8 @@ sequenceDiagram
         Note over M: _shape: score = 1/(1+abs(rank))
         M-->>C: shaped hits
     else strategy hybrid
-        M->>S: semantic_search(top_k*2)
-        M->>S: keyword_search(top_k*2)
+        M->>S: semantic_search(query_emb, top_k*2)
+        M->>S: keyword_search(query, top_k*2)
         S-->>M: both raw lists
         Note over M: RRF fuse K=60: score = Σ 1/(60+rank) over both lists
         Note over M: recency: score *= 0.5 + 0.5*30/(30+age_days) — newer wins ties
@@ -82,6 +96,7 @@ sequenceDiagram
     rect rgb(255,250,235)
     note over C,L: reflect(query), needs LLM, never blocks recall
     C->>M: reflect(query, filters)
+    M->>E: embed(query)
     M->>S: hybrid search (RRF)
     S-->>M: memories
     alt no hits OR LLM call fails
@@ -99,6 +114,7 @@ sequenceDiagram
     opt update(text, memory_id)
         C->>M: update()
         M->>E: embed(text)
+        E-->>M: emb
         M->>S: update row + vector + FTS + history[UPDATE], then commit
         M-->>C: {results: [UPDATE]}
     end
@@ -119,17 +135,10 @@ sequenceDiagram
     end
     end
 
-    %% ==================== HERMES PROVIDER WRAPPER ====================
-    rect rgb(240,245,255)
-    note over C,S: Hermes MemLiteProvider (lifecycle adapter)
-    Note over HV: initialize → prefetch(cache drain) → sync_turn(daemon) → queue_prefetch(next turn)
-    Note over HV: circuit breaker: 5 consecutive failures -> 2 min backoff
-    end
-
     %% ==================== CONCURRENCY ====================
     rect rgb(255,240,240)
     note over S,P2: multi-process access
-    P2->>S: connect (busy_timeout=5000 + retry x6)
+    P2->>S: connect (busy_timeout=5000 + retry x6 + synchronous=NORMAL)
     alt P2 writes while S holds write lock
         P2-->>S: SQLITE_BUSY -> busy_timeout wait -> proceeds after COMMIT
     else P2 reads while S writes
@@ -161,3 +170,4 @@ data — thresholds are tuned to fail toward ADD.
 | Any mutation in the reconcile loop fails | whole transaction rolls back — no partial writes |
 | db locked by another process | busy_timeout=5000 wait, then connect retry ×6 |
 | reflect LLM fails | returns raw memories (`synthesized: false`), recall unaffected |
+| Background sync fails 5x | circuit breaker: 2 min backoff, turns never block |
