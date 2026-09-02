@@ -125,19 +125,6 @@ def _shared_bigrams(a: str, b: str) -> set[str]:
     return _bigrams(a) & _bigrams(b)
 
 
-def _jaccard(a: str, b: str) -> float:
-    """Token-set Jaccard overlap in [0,1]; 1 = identical content words.
-
-    Kept as a diagnostic helper — the reconcile decision itself uses
-    _shared_bigrams, which separates value-change from same-entity-different-fact
-    (Jaccard scores both ~0.33 and cannot).
-    """
-    sa, sb = _content_tokens(a), _content_tokens(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
 def _is_retraction(text: str) -> bool:
     m = _RETRACT_RE.search(text)
     if m is None:
@@ -292,9 +279,8 @@ class Memory:
         """No-LLM reconcile. Arithmetic decision over semantic + token overlap.
 
         For each new text: retrieve top similar existing memories in scope, then:
-          - DELETE  if the text is an explicit retraction AND closely matches one.
-          - UPDATE  if semantic cosine >= COS_UPDATE and token jaccard >= JAC_UPDATE
-                    (same claim reworded or changed).
+          - DELETE  if the text is an explicit retraction AND closely matches one (cos>=0.72).
+          - UPDATE  if semantic cosine >= 0.65 AND shared content-bigram (or cos>=0.90 duplicate).
           - ADD     otherwise (conservative: never drop new information).
 
         Performance: embeddings are batched (one API call) and all reconciled

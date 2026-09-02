@@ -125,7 +125,8 @@ Hybrid mode fuses the two lists with **reciprocal rank fusion (RRF, K=60)** —
 rank-based and scale-free, unlike a raw bm25/cosine blend — then applies a
 **recency decay** tie-breaker (`score *= 0.5 + 0.5 * 30/(30 + age_days)`), so a
 newer, contradicting memory outranks the stale one it replaced. See
-[docs/flows.md](docs/flows.md) for sequence diagrams of every flow.
+[docs/sequence-all.md](docs/sequence-all.md) for the single UML sequence
+diagram covering every flow (plus decision thresholds and failure semantics).
 
 ## Config knobs
 
