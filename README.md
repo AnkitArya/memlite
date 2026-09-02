@@ -56,7 +56,11 @@ m.update("User loves spicy Thai food", memory_id=hits[0]["id"])
 m.delete(memory_id=hits[0]["id"])
 ```
 
-`infer=True` (default) reconciles each new piece of information against existing
+`infer=True` (default) now mirrors mem0's two-pass pipeline. **Pass 1 (extraction)**:
+if an LLM is configured, the conversation is distilled into discrete, durable
+facts — small talk, questions and assistant filler are dropped. Statements with
+retraction intent ("Forget X") bypass extraction so the DELETE signal survives.
+**Pass 2 (reconcile)**: each extracted fact is reconciled against existing
 memories **deterministically — with arithmetic, no LLM call**: retrieve the
 top semantically similar memories in scope, then decide
 
@@ -64,7 +68,9 @@ top semantically similar memories in scope, then decide
   longer ...") *and* closely matches an existing memory (cosine ≥ 0.65)
 - **UPDATE** — cosine ≥ 0.65 **and** the pair shares a content-word bigram
   (the attribute key phrase — "favorite color", "works as" — survives a value
-  change, while a *different* fact about the same entity shares none)
+  change, while a *different* fact about the same entity shares none), or
+  cosine ≥ 0.90 (near-duplicate guard: reworded re-adds refresh in place
+  instead of bloating the store)
 - **ADD** — everything else. Conservative default: a wrong ADD is a duplicate,
   a wrong UPDATE/DELETE loses information. Known conservative miss: a value
   change with *no* lexical residue ("lives in Hyderabad" → "moved to
@@ -113,6 +119,12 @@ retain / recall / reflect model (mem0 doesn't have these):
 > graphs, mental models, consolidation) is exactly the heavyweight machinery this
 > lean store deliberately omits. `memory_type` + `reflect` capture most of the
 > user-facing value at negligible complexity.
+
+Hybrid mode fuses the two lists with **reciprocal rank fusion (RRF, K=60)** —
+rank-based and scale-free, unlike a raw bm25/cosine blend — then applies a
+**recency decay** tie-breaker (`score *= 0.5 + 0.5 * 30/(30 + age_days)`), so a
+newer, contradicting memory outranks the stale one it replaced. See
+[docs/flows.md](docs/flows.md) for sequence diagrams of every flow.
 
 ## Config knobs
 
