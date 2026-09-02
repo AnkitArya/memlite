@@ -85,7 +85,19 @@ m.add("Actually, my favorite color changed to magenta now", user_id="alice")
 
 m.add("Forget that I said I love pineapple on pizza", user_id="alice")
 # → [{"id": "<pineapple-id>", "memory": None, "event": "DELETE"}]
+
+# programmatic fact (already extracted by you — no LLM extraction pass):
+m.add_raw("User prefers snake_case in Python", user_id="alice")
 ```
+
+### Hermes Agent plugin
+
+MemLite ships as a first-class Hermes memory provider
+(`~/.hermes/plugins/memory/memlite/`): three lifecycle hooks per turn
+(prefetch / sync-turn / queue-prefetch) plus agent tools
+`memlite_search`, `memlite_add`, `memlite_forget`. Store lives at
+`$HERMES_HOME/memlite.db`, profile-scoped. See the plugin README for
+setup (`hermes config set memory.provider memlite`).
 
 The LLM's only role is **extraction** (pass 1). The ADD/UPDATE/DELETE decision
 (pass 2) is always the deterministic arithmetic rule — no LLM call, no prompt

@@ -11,6 +11,7 @@ sequenceDiagram
     participant L as LLM (extraction only)
     participant E as Embedder (OpenAI-compatible, batched)
     participant S as Store (SQLite: memories + vec0 + FTS5 + history)
+    participant HV as Hermes MemLiteProvider
     participant P2 as Other Process
 
     %% ==================== WRITE: add() ====================
@@ -116,6 +117,13 @@ sequenceDiagram
         M->>S: list_all (scope + memory_type)
         M-->>C: {results: [...]}
     end
+    end
+
+    %% ==================== HERMES PROVIDER WRAPPER ====================
+    rect rgb(240,245,255)
+    note over C,S: Hermes MemLiteProvider (lifecycle adapter)
+    Note over HV: initialize → prefetch(cache drain) → sync_turn(daemon) → queue_prefetch(next turn)
+    Note over HV: circuit breaker: 5 consecutive failures -> 2 min backoff
     end
 
     %% ==================== CONCURRENCY ====================
