@@ -57,17 +57,17 @@ sequenceDiagram
     note over C,E: search(query, strategy, filters) — no LLM needed
     C->>M: search(query)
     M->>E: embed(query)
-    alt strategy="semantic" (default)
+    alt strategy semantic (default)
         M->>S: vec0 cosine kNN + scope join/filter
         S-->>M: raw rows
         Note over M: _shape: score = 1 - cosine distance
         M-->>C: scored hits
-    else strategy="keyword"
+    else strategy keyword
         M->>S: FTS5 MATCH (BM25)
         S-->>M: raw rows
         Note over M: _shape: score = 1/(1+abs(rank))
         M-->>C: shaped hits
-    else strategy="hybrid"
+    else strategy hybrid
         M->>S: semantic_search(top_k*2)
         M->>S: keyword_search(top_k*2)
         S-->>M: both raw lists
@@ -79,7 +79,7 @@ sequenceDiagram
 
     %% ==================== SYNTHESIS: reflect() ====================
     rect rgb(255,250,235)
-    note over C,L: reflect(query) — needs LLM; never blocks recall
+    note over C,L: reflect(query), needs LLM, never blocks recall
     C->>M: reflect(query, filters)
     M->>S: hybrid search (RRF)
     S-->>M: memories
@@ -98,17 +98,17 @@ sequenceDiagram
     opt update(text, memory_id)
         C->>M: update()
         M->>E: embed(text)
-        M->>S: update row + vector + FTS + history[UPDATE]; commit
+        M->>S: update row + vector + FTS + history[UPDATE], then commit
         M-->>C: {results: [UPDATE]}
     end
     opt delete(memory_id)
         C->>M: delete()
-        M->>S: delete from memories + vectors + FTS; history[DELETE, old_memory]; commit
+        M->>S: delete from memories + vectors + FTS + history[DELETE, old_memory], then commit
         M-->>C: {results: [DELETE]}
     end
     opt delete_all(scope)
         C->>M: delete_all()
-        M->>S: BEGIN IMMEDIATE; delete each (in_txn); COMMIT — single fsync batch
+        M->>S: BEGIN IMMEDIATE, delete each (in_txn), then COMMIT (single fsync batch)
         M-->>C: {results: [DELETE...]}
     end
     opt get_all(filters)

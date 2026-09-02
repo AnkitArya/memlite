@@ -283,9 +283,11 @@ class Memory:
           - UPDATE  if semantic cosine >= 0.65 AND shared content-bigram (or cos>=0.90 duplicate).
           - ADD     otherwise (conservative: never drop new information).
 
-        Performance: embeddings are batched (one API call) and all reconciled
-        mutations are applied in ONE SQLite transaction instead of one commit
-        per fact.
+        Performance: embeddings are batched (one API call). I/O boundaries are
+        strictly ordered: network I/O (embedding, LLM) FIRST, then read-only
+        kNN searches, then ONE write transaction (BEGIN IMMEDIATE -> batch
+        mutations -> COMMIT). The SQLite lock is never held across network
+        calls.
         """
         store = self._store_get()
         scope = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
@@ -294,24 +296,25 @@ class Memory:
         if not cleaned:
             return {"results": []}
 
-        # 1) batch-embed everything in one API call (no per-fact round-trips)
+        # 1) network I/O: batch-embed everything in one API call
         embs = self.embedder.embed_many(cleaned)
 
-        # 2) decide for each fact (read-only; can stay per-fact searches since
-        #    they are reads, not transactions)
-        # Warm the connection's txn state once so all mutations below share a
-        # single commit (SQLite: one fsync instead of N).
+        # 2) read-only phase (NO transaction held): retrieve candidates and
+        #    decide for each fact; also collect prior texts for history rows.
+        plan: list[tuple[str, str, list]] = []  # (text, emb, existing)
+        for text, emb in zip(cleaned, embs):
+            existing = []
+            try:
+                existing = store.semantic_search(emb, top_k=5, filters=scope)
+            except Exception:
+                existing = []
+            plan.append((text, emb, existing))
+
+        # 3) single write transaction: all mutations, one commit (one fsync)
         store.begin()
         try:
             results = []
-            for text, emb in zip(cleaned, embs):
-                # retrieve top similar existing memories in the same scope
-                existing = []
-                try:
-                    existing = store.semantic_search(emb, top_k=5, filters=scope)
-                except Exception:
-                    existing = []
-
+            for text, emb, existing in plan:
                 op = self._decide(text, emb, existing)
 
                 if op["event"] == "ADD":
@@ -322,10 +325,8 @@ class Memory:
                     results.append({"id": mid, "memory": text, "event": "ADD"})
                 elif op["event"] == "UPDATE":
                     mid = op["id"]
-                    # normalize pronouns to a durable fact
-                    new_text = text
-                    store.update_memory(mid, new_text, emb, in_txn=True)
-                    results.append({"id": mid, "memory": new_text, "event": "UPDATE"})
+                    store.update_memory(mid, text, emb, in_txn=True)
+                    results.append({"id": mid, "memory": text, "event": "UPDATE"})
                 elif op["event"] == "DELETE":
                     mid = op["id"]
                     store.delete(mid, in_txn=True)

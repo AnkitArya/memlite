@@ -75,6 +75,10 @@ class Store:
         self.conn = self._connect()
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        # WAL + NORMAL: no fsync per commit, durability preserved vs power loss
+        # only at OS level — the standard safe trade-off for WAL databases.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         # Load sqlite-vec into this connection
         self.conn.enable_load_extension(True)
