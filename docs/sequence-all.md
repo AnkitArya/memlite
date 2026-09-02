@@ -9,14 +9,14 @@ sequenceDiagram
     autonumber
     actor C as Caller / App
     participant M as Memory (core.py)
-    participant L as LLM (optional)
+    participant L as LLM (extraction only)
     participant E as Embedder (OpenAI-compatible)
     participant S as Store (SQLite: memories + vec0 + FTS5 + history)
     participant P2 as Other Process
 
     %% ============ WRITE: add() ============
     rect rgb(235,244,255)
-    C->>M: add(messages, infer=, reconcile_with_llm=)
+    C->>M: add(messages, infer=)
     M->>M: _to_texts(messages) -> texts[]
     alt infer=False (raw chunks)
         M->>E: embed_many(texts)   [one batched API call]
@@ -28,7 +28,7 @@ sequenceDiagram
         M-->>C: {results: [ADD...]}
     else infer=True — extraction + reconcile
         M->>M: split: retractions (_is_retraction) vs normal
-        opt LLM configured
+        opt LLM configured (extraction only — reconcile stays deterministic)
             M->>L: extract(normal texts)
             L-->>M: discrete durable facts (filler dropped)
             Note over M: empty extraction -> fallback to raw chunks (never drop data)
@@ -49,18 +49,6 @@ sequenceDiagram
                 M->>S: insert(text, emb) + history[ADD]
                 M-->>C: event ADD
             end
-        end
-        opt reconcile_with_llm=True (LLM decides instead of arithmetic)
-            M->>E: embed(facts)
-            M->>S: semantic_search(top_k=8, scope)
-            S-->>M: existing memories (ids + text)
-            M->>L: reconcile prompt (statement + existing ids)
-            L-->>M: {"memory": [ADD|UPDATE|DELETE + id?, text?]}
-            M->>M: validate ids against retrieved set
-            alt LLM output unusable
-                M->>S: fallback raw ADD (never drop data)
-            end
-            M->>S: apply validated ops transactionally
         end
         M-->>C: {results: [...]}
     end

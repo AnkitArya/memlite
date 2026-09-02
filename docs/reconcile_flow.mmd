@@ -14,10 +14,9 @@ flowchart TD
     F --> G["semantic_search top-5 in scope<br/>vec0 · distance_metric=cosine<br/>(was silent L2 — fixed)"]
     G --> H{"_decide()<br/>pure fn · 10 unit tests"}
 
-    %% ---- LLM lane (opt-in) ----
-    B -.->|"reconcile_with_llm=True (opt-in)"| P["retrieve top-8 in scope"]
-    P --> P2["1 LLM call → ops JSON<br/>ADD / UPDATE / DELETE"]
-    P2 --> Q["validate ids → apply<br/>empty / invalid → raw ADD<br/>(never drop data)"]
+    %% ---- extraction lane (LLM, default when configured) ----
+    B -.->|"infer=True + LLM configured: extraction pass"| P["LLM distills conversation<br/>discrete durable facts<br/>(retractions bypass extraction)"]
+    P --> F["embed each fact"]
 
     %% ---- _decide outcomes ----
     H -->|"retraction intent + cos ≥ 0.65"| DEL["DELETE<br/>&quot;forget / no longer&quot; regex<br/>+ &quot;don't forget&quot; negation guard"]

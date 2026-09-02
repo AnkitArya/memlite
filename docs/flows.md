@@ -57,6 +57,10 @@ sequenceDiagram
 
 ## 3. add(infer=True, reconcile_with_llm=True) — LLM reconcile variant
 
+> **Removed.** Reconcile is always deterministic (see flow 2). This section
+> documents the old opt-in that no longer exists; kept only so old links make
+> sense. Use flow 2 for all infer=True adds.
+
 ```mermaid
 sequenceDiagram
     participant C as Caller

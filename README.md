@@ -85,12 +85,11 @@ m.add("Forget that I said I love pineapple on pizza", user_id="alice")
 # → [{"id": "<pineapple-id>", "memory": None, "event": "DELETE"}]
 ```
 
-Pass `reconcile_with_llm=True` (with an LLM in config) to hand the same
-ADD/UPDATE/DELETE decision to an LLM instead of the arithmetic rule — useful
-for retraction-heavy or heavily-reworded workloads where the lexical gate is
-too conservative. If the LLM is unavailable or returns nothing usable, `add`
-falls back to a plain `ADD` of the raw text — it never silently drops
-information.
+The LLM's only role is **extraction** (pass 1). The ADD/UPDATE/DELETE decision
+(pass 2) is always the deterministic arithmetic rule — no LLM call, no prompt
+injection surface, no provider dependency in the write path. If the LLM is
+unavailable, extraction falls back to the raw chunks — `add` never silently
+drops information.
 
 ### Hindsight-inspired additions
 

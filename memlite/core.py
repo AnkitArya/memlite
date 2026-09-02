@@ -56,66 +56,8 @@ Return STRICTLY this JSON, no prose, no markdown fences:
 {{"memories": ["fact 1", "fact 2"]}}
 """
 
-_RECONCILE_PROMPT = """You maintain a user's memory store. The user just made a statement.
-Your ONLY job is to reflect that statement into the memory store as exactly ONE
-operation. NEVER invent facts, names, or topics that are not present in the
-user's statement.
-
-The user's statement is:
-"{conversation}"
-
-Decide the single operation to apply:
-- DELETE: the statement explicitly retracts something that is in the Existing
-  Memories (e.g. "forget X", "I never liked X", "remove what I said about X").
-  Reference that existing memory's id; omit text.
-- UPDATE: the statement clearly replaces or refines an Existing Memory with the
-  SAME topic (e.g. favorite color changed from teal to magenta). Reference that
-  existing memory's id and provide the new full text, phrased as a durable fact.
-- ADD: otherwise, the statement is new information. Provide the full text as a
-  durable, self-contained fact (rewrite "I/my" -> "User"). Keep it faithful to
-  the statement — change only pronoun and tense, never the content.
-
-ALWAYS echo the user's actual content. If the example statement mentions a color
-change, your output must mention that exact color change — never replace it with
-an unrelated topic.
-
-Return STRICTLY this JSON, no prose, no markdown fences:
-{{"memory": [{{"event": "ADD", "text": "..."}}]}}
-or for update/delete:
-{{"memory": [{{"event": "UPDATE", "id": "<existing id>", "text": "..."}}]}}
-{{"memory": [{{"event": "DELETE", "id": "<existing id>"}}]}}
-
-Existing Memories (only these ids are valid; [] means none):
-{existing_memories}
-"""
-
-
-def _parse_ops(text: str) -> list[dict]:
-    """Parse the reconcile LLM output into a list of op dicts. Tolerant of fences."""
-    import json
-
-    # cut to the first {...} block if there's prose around it
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return []
-    try:
-        val = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
-    ops = val.get("memory", []) if isinstance(val, dict) else []
-    out = []
-    for o in ops:
-        if not isinstance(o, dict):
-            continue
-        ev = str(o.get("event", "")).upper()
-        if ev in ("ADD", "UPDATE", "DELETE"):
-            out.append({"event": ev, "id": o.get("id"), "text": o.get("text")})
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Deterministic (no-LLM) reconcile
-#
 # ADD / UPDATE / DELETE is decided with arithmetic, not a model:
 #   - DELETE: the new text carries an explicit retraction intent (lexical
 #     pattern) AND matches an existing memory closely.
@@ -265,16 +207,15 @@ class Memory:
         metadata=None,
         infer=True,
         memory_type="world_fact",
-        reconcile_with_llm=False,
     ):
         """Create memory/memories. mirrors mem0 (incl. UPDATE/DELETE reconciliation).
 
         messages: str | dict | list[dict].
-        infer=True: reconcile each new piece of information against existing
-          memories — deterministically (no LLM) by default:
+        infer=True (default): 1) LLM extraction pass distills the conversation
+          into discrete durable facts (no-LLM fallback: raw chunks are treated
+          as already-extracted), 2) each fact is reconciled against existing
+          memories deterministically (no LLM):
             ADD (new fact) | UPDATE (reworded/changed same claim) | DELETE (retraction).
-          Pass reconcile_with_llm=True (and an LLM in config) to use an LLM for the
-          same decision instead of the arithmetic rule.
         infer=False: raw text chunks stored directly as ADD (no LLM).
         memory_type: 'world_fact' (default) or 'experience' (hindsight-inspired).
 
@@ -308,7 +249,6 @@ class Memory:
         return self._reconcile_many(
             extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
             metadata=metadata, memory_type=memory_type,
-            use_llm=(has_llm and reconcile_with_llm),
         )
 
     def _raw_add(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
@@ -327,12 +267,9 @@ class Memory:
         return {"results": results}
 
     def _reconcile_many(self, texts, *, user_id, agent_id, run_id, metadata,
-                        memory_type, use_llm=False):
-        if use_llm:
-            return self._reconcile_add(
-                texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
-                metadata=metadata, memory_type=memory_type,
-            )
+                        memory_type):
+        """Reconcile is ALWAYS deterministic (no LLM): extraction may use the
+        LLM, the ADD/UPDATE/DELETE decision does not."""
         return self._deterministic_reconcile(
             texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
             metadata=metadata, memory_type=memory_type,
@@ -452,75 +389,6 @@ class Memory:
         # ADD: everything else — including high-cosine + no shared bigram
         # (same entity, different fact) which must be kept as a separate memory.
         return {"event": "ADD", "cos": cos_}
-
-    def _reconcile_add(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
-        """Single-call reconcile: semantic-retrieve existing, LLM decides ops, apply."""
-        store = self._store_get()
-        conversation = "\n".join(f"- {t}" for t in texts)
-        scope = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
-
-        # 1) retrieve existing memories in same scope (best-effort, never fatal)
-        existing = []
-        try:
-            qv = self.embedder.embed(conversation)
-            existing = store.semantic_search(qv, top_k=8, filters=scope)
-        except Exception:
-            existing = []
-
-        existing_block = "\n".join(
-            f'{{"id": "{m["id"]}", "text": "{m["memory"]}"}}' for m in existing
-        ) or "[]"
-
-        prompt = _RECONCILE_PROMPT.format(
-            conversation=conversation, existing_memories=existing_block,
-        )
-
-        # 2) LLM decides ops
-        ops = []
-        try:
-            r = self._llm_client.chat.completions.create(
-                model=self._llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            ops = _parse_ops(r.choices[0].message.content)
-        except Exception:
-            ops = []  # fall through to raw ADD below; never drop data
-
-        # 3) apply ops (defensive: validate ids before any write)
-        results = []
-        valid_ids = {m["id"] for m in existing}
-        applied_ops = []
-        for op in ops:
-            event = op.get("event")
-            text = (op.get("text") or "").strip()
-            if event == "ADD" and text:
-                applied_ops.append(("ADD", text, None))
-            elif event == "UPDATE" and text and op.get("id") in valid_ids:
-                applied_ops.append(("UPDATE", text, op["id"]))
-            elif event == "DELETE" and op.get("id") in valid_ids:
-                applied_ops.append(("DELETE", None, op["id"]))
-
-        # If the LLM produced nothing usable, fall back to adding the raw chunks.
-        if not applied_ops:
-            applied_ops = [("ADD", t.strip(), None) for t in texts if t.strip()]
-
-        for event, text, mid in applied_ops:
-            if event == "ADD":
-                emb = self.embedder.embed(text)
-                new_id = store.insert(
-                    text, emb, user_id=user_id, agent_id=agent_id, run_id=run_id,
-                    metadata=metadata, memory_type=memory_type,
-                )
-                results.append({"id": new_id, "memory": text, "event": "ADD"})
-            elif event == "UPDATE":
-                emb = self.embedder.embed(text)
-                store.update_memory(mid, text, emb)
-                results.append({"id": mid, "memory": text, "event": "UPDATE"})
-            elif event == "DELETE":
-                store.delete(mid)
-                results.append({"id": mid, "memory": None, "event": "DELETE"})
-        return {"results": results}
 
     @staticmethod
     def _to_texts(messages) -> list[str]:
