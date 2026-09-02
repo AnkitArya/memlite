@@ -63,9 +63,18 @@ def test_unrelated_adds():
 
 def test_retraction_deletes_close_match():
     # "forget pineapple" vs existing pineapple fact: cos 0.851 -> DELETE
+    # (DELETE bar is 0.82: destructive action needs a high cosine)
     op = D("Forget that I said I love pineapple on pizza", None,
            [_cand("User loves pineapple on pizza", 0.851)])
     assert op["event"] == "DELETE", op
+
+
+def test_retraction_at_mild_overlap_does_not_delete():
+    # retraction intent + mild topical overlap (0.70) -> must NOT delete;
+    # modern embeddings put unrelated-but-topical pairs at 0.65-0.73.
+    op = D("Forget that I said I love pineapple on pizza", None,
+           [_cand("User loves spicy indian food", 0.70)])
+    assert op["event"] == "ADD", op
 
 
 def test_retraction_without_match_adds():

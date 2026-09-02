@@ -252,18 +252,26 @@ class Memory:
         )
 
     def _raw_add(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
-        """Plain ADD path with batched embedding (one API call for N texts)."""
+        """Plain ADD path with batched embedding + single transaction."""
         cleaned = [t.strip() for t in texts if t.strip()]
         if not cleaned:
             return {"results": []}
         embs = self.embedder.embed_many(cleaned)
-        results = []
-        for mem, emb in zip(cleaned, embs):
-            mid = self._store_get().insert(
-                mem, emb, user_id=user_id, agent_id=agent_id,
-                run_id=run_id, metadata=metadata, memory_type=memory_type,
-            )
-            results.append({"id": mid, "memory": mem, "event": "ADD"})
+        store = self._store_get()
+        store.begin()
+        try:
+            results = []
+            for mem, emb in zip(cleaned, embs):
+                mid = store.insert(
+                    mem, emb, user_id=user_id, agent_id=agent_id,
+                    run_id=run_id, metadata=metadata, memory_type=memory_type,
+                    in_txn=True,
+                )
+                results.append({"id": mid, "memory": mem, "event": "ADD"})
+            store.commit()
+        except Exception:
+            store.rollback()
+            raise
         return {"results": results}
 
     def _reconcile_many(self, texts, *, user_id, agent_id, run_id, metadata,
@@ -313,52 +321,73 @@ class Memory:
           - UPDATE  if semantic cosine >= COS_UPDATE and token jaccard >= JAC_UPDATE
                     (same claim reworded or changed).
           - ADD     otherwise (conservative: never drop new information).
+
+        Performance: embeddings are batched (one API call) and all reconciled
+        mutations are applied in ONE SQLite transaction instead of one commit
+        per fact.
         """
         store = self._store_get()
         scope = {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}
 
-        results = []
-        for text in texts:
-            text = text.strip()
-            if not text:
-                continue
-            emb = self.embedder.embed(text)
+        cleaned = [t.strip() for t in texts if t.strip()]
+        if not cleaned:
+            return {"results": []}
 
-            # retrieve top similar existing memories in the same scope
-            existing = []
-            try:
-                existing = store.semantic_search(emb, top_k=5, filters=scope)
-            except Exception:
+        # 1) batch-embed everything in one API call (no per-fact round-trips)
+        embs = self.embedder.embed_many(cleaned)
+
+        # 2) decide for each fact (read-only; can stay per-fact searches since
+        #    they are reads, not transactions)
+        # Warm the connection's txn state once so all mutations below share a
+        # single commit (SQLite: one fsync instead of N).
+        store.begin()
+        try:
+            results = []
+            for text, emb in zip(cleaned, embs):
+                # retrieve top similar existing memories in the same scope
                 existing = []
+                try:
+                    existing = store.semantic_search(emb, top_k=5, filters=scope)
+                except Exception:
+                    existing = []
 
-            op = self._decide(text, emb, existing)
+                op = self._decide(text, emb, existing)
 
-            if op["event"] == "ADD":
-                mid = store.insert(
-                    text, emb, user_id=user_id, agent_id=agent_id, run_id=run_id,
-                    metadata=metadata, memory_type=memory_type,
-                )
-                results.append({"id": mid, "memory": text, "event": "ADD"})
-            elif op["event"] == "UPDATE":
-                mid = op["id"]
-                # normalize pronouns to a durable fact
-                new_text = text
-                store.update_memory(mid, new_text, emb)
-                results.append({"id": mid, "memory": new_text, "event": "UPDATE"})
-            elif op["event"] == "DELETE":
-                mid = op["id"]
-                store.delete(mid)
-                results.append({"id": mid, "memory": None, "event": "DELETE"})
+                if op["event"] == "ADD":
+                    mid = store.insert(
+                        text, emb, user_id=user_id, agent_id=agent_id, run_id=run_id,
+                        metadata=metadata, memory_type=memory_type, in_txn=True,
+                    )
+                    results.append({"id": mid, "memory": text, "event": "ADD"})
+                elif op["event"] == "UPDATE":
+                    mid = op["id"]
+                    # normalize pronouns to a durable fact
+                    new_text = text
+                    store.update_memory(mid, new_text, emb, in_txn=True)
+                    results.append({"id": mid, "memory": new_text, "event": "UPDATE"})
+                elif op["event"] == "DELETE":
+                    mid = op["id"]
+                    store.delete(mid, in_txn=True)
+                    results.append({"id": mid, "memory": None, "event": "DELETE"})
+            store.commit()
+        except Exception:
+            store.rollback()
+            raise
         return {"results": results}
 
     @staticmethod
-    def _decide(text: str, emb, existing: list, cos_update=0.65):
+    def _decide(text: str, emb, existing: list, cos_update=0.65, cos_delete=0.82):
         """Pure decision function (unit-testable, no store/io dependence).
 
         UPDATE gate = shared content-bigrams (attribute key phrase survives a
         value change; a different fact about the same entity shares none).
         ADD is the conservative default — a wrong ADD is a duplicate, a wrong
         UPDATE/DELETE loses information.
+
+        cos_update (0.65) is the UPDATE + duplicate-guard gate: a mistake only
+        rephrases a memory, recoverable. cos_delete (0.82) is deliberately
+        higher: DELETE is destructive, and mild-topical-overlap embeddings
+        (0.65–0.73 on bge/calibrated sets) must never trigger data loss.
         """
         if not existing:
             return {"event": "ADD"}
@@ -367,9 +396,11 @@ class Memory:
         cos_ = float(best.get("score", 0.0))  # cosine similarity (1 - distance)
         best_text = best["memory"]
 
-        # DELETE: explicit retraction intent AND close match to an existing fact
+        # DELETE: explicit retraction intent AND a CLOSE match (0.82 — a
+        # destructive action needs a high bar; 0.65 is too permissive for
+        # modern embedding models where topical overlap lands at 0.65-0.73).
         if _is_retraction(text):
-            if cos_ >= cos_update:
+            if cos_ >= cos_delete:
                 return {"event": "DELETE", "id": best["id"]}
             # retraction intent but no close match: nothing to retract -> ADD no-op
             return {"event": "ADD"}
@@ -522,10 +553,17 @@ class Memory:
         return {"results": [{"id": memory_id, "event": "DELETE"}] if ok else []}
 
     def delete_all(self, *, user_id=None, agent_id=None, run_id=None) -> dict:
+        """Single-transaction batch delete (no fetch-then-loop N commits)."""
         store = self._store_get()
         rows = store.list_all(filters={"user_id": user_id, "agent_id": agent_id, "run_id": run_id})
-        for r in rows:
-            store.delete(r["id"])
+        store.begin()
+        try:
+            for r in rows:
+                store.delete(r["id"], in_txn=True)
+            store.commit()
+        except Exception:
+            store.rollback()
+            raise
         return {"results": [{"id": r["id"], "event": "DELETE"} for r in rows]}
 
     def reset(self):

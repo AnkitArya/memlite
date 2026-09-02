@@ -59,17 +59,21 @@ sequenceDiagram
     C->>M: search(query, strategy, filters)
     M->>E: embed(query)
     alt strategy="semantic" (default)
-        M->>S: vec0 cosine kNN (MATCH...LIMIT, over-fetch x10) + scope join/filter
-        S-->>C: hits (score = 1 - cosine distance)
+        M->>S: vec0 cosine kNN (MATCH...LIMIT + adaptive widening) + scope join/filter
+        S-->>M: raw rows
+        Note over M: shape scores/fields
+        M-->>C: scored hits
     else strategy="keyword"
         M->>S: FTS5 MATCH (BM25 rank)
-        S-->>C: hits (score = 1/(1+rank))
+        S-->>M: raw rows
+        M-->>C: shaped hits (score = 1/(1+abs(rank)), rank from fts)
     else strategy="hybrid"
         M->>S: semantic_search(top_k*2)
         M->>S: keyword_search(top_k*2)
+        S-->>M: both raw lists
         M->>M: RRF fuse: score = Σ 1/(60+rank) across both lists
         M->>M: recency: score *= 0.5 + 0.5*30/(30+age_days)  [newer wins ties]
-        S-->>C: top_k fused, recency-weighted
+        M-->>C: top_k fused, recency-weighted
     end
     end
 

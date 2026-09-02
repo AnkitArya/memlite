@@ -60,6 +60,12 @@ CREATE TABLE IF NOT EXISTS history (
 
 _DISTANCE = "cosine"  # vec0 supports cosine
 
+# Cap on the vec0 kNN scan widening: beyond this the brute-force scan cost
+# dominates; instead of rescanning the whole table, accept fewer results.
+_MAX_KNN_SCAN = 50000
+# sqlite-vec hard limit: "k value in knn query too large" above 4096.
+_VEC0_K_MAX = 4096
+
 
 class Store:
     def __init__(self, db_path: str = "memlite.db", dims: int = 768):
@@ -131,6 +137,17 @@ class Store:
         else:
             cur.executescript(_SCHEMA_VEC.format(dims=self.dims, distance=_DISTANCE))
 
+    # ---------- transaction control ----------
+    def begin(self):
+        """Explicit BEGIN so multiple mutations share one commit (one fsync)."""
+        self.conn.execute("BEGIN IMMEDIATE")
+
+    def commit(self):
+        self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
     # ---------- writes ----------
     def insert(
         self,
@@ -143,7 +160,10 @@ class Store:
         metadata: dict | None = None,
         memory_id: str | None = None,
         memory_type: str = "world_fact",
+        in_txn: bool = False,
     ) -> str:
+        """Insert one memory. in_txn=True skips commit — the caller owns the
+        transaction (single fsync for N mutations)."""
         mid = memory_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         vec_blob = self._vector_to_blob(embedding)
@@ -175,11 +195,13 @@ class Store:
                 " VALUES (?,?,?,?,?,?)",
                 (str(uuid.uuid4()), mid, None, memory, "ADD", now),
             )
-            self.conn.commit()
+            if not in_txn:
+                self.conn.commit()
         return mid
 
     def update_memory(
-        self, memory_id: str, memory: str, embedding: list[float]
+        self, memory_id: str, memory: str, embedding: list[float],
+        in_txn: bool = False,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -207,10 +229,11 @@ class Store:
                 " VALUES (?,?,?,?,?,?)",
                 (str(uuid.uuid4()), memory_id, old, memory, "UPDATE", now),
             )
-            self.conn.commit()
+            if not in_txn:
+                self.conn.commit()
         return True
 
-    def delete(self, memory_id: str) -> bool:
+    def delete(self, memory_id: str, in_txn: bool = False) -> bool:
         with self._lock:
             cur = self.conn.cursor()
             r = cur.execute("SELECT id FROM memories WHERE mem_id=?", (memory_id,)).fetchone()
@@ -229,7 +252,8 @@ class Store:
                 " VALUES (?,?,?,?,?,?)",
                 (str(uuid.uuid4()), memory_id, old_text, None, "DELETE", now),
             )
-            self.conn.commit()
+            if not in_txn:
+                self.conn.commit()
         return True
 
     # ---------- reads ----------
@@ -258,35 +282,47 @@ class Store:
     def semantic_search(
         self, query_embedding: list[float], top_k: int = 5, filters: dict | None = None
     ) -> list[dict]:
-        """Cosine-similarity search over the vec0 table, joined to rows + filters."""
+        """Cosine-similarity search over the vec0 table, joined to rows + filters.
+
+        Over-fetch trap: vec0's kNN scans the WHOLE table, so with filters the
+        join can discard every hit (tenant has 10 rows in a 50k table; the
+        global top-100 may contain none of them). Fix: progressively widen the
+        kNN limit until enough scoped rows survive or the table is exhausted.
+        """
         blob = self._vector_to_blob(query_embedding)
         # vec0 requires MATCH + LIMIT as the LAST clauses of the query it scans,
         # so run the knn in a subquery, then join+filter rows in the outer query.
-        sql = """
-            SELECT m.mem_id AS id,
-                   (1 - knn.distance) AS score,
-                   m.memory, m.memory_type,
-                   m.user_id, m.agent_id, m.run_id, m.metadata,
-                   m.created_at, m.updated_at
-            FROM (
-                SELECT rowid, distance
-                FROM memory_vectors
-                WHERE embedding MATCH ?
-                LIMIT ?
-            ) knn
-            JOIN memories m ON m.id = knn.rowid
-            WHERE 1=1
-        """
-        # over-fetch so post-filtering still yields top_k per scope
-        args = [blob, top_k * 10]
-        for key in ("user_id", "agent_id", "run_id", "memory_type"):
-            v = filters.get(key) if filters else None
-            if v is not None:
+        filter_keys = [k for k in ("user_id", "agent_id", "run_id", "memory_type")
+                       if (filters or {}).get(k) is not None]
+        widen = 0
+        knn_limit = min(top_k * 10, _VEC0_K_MAX)
+        while True:
+            sql = """
+                SELECT m.mem_id AS id,
+                       (1 - knn.distance) AS score,
+                       m.memory, m.memory_type,
+                       m.user_id, m.agent_id, m.run_id, m.metadata,
+                       m.created_at, m.updated_at
+                FROM (
+                    SELECT rowid, distance
+                    FROM memory_vectors
+                    WHERE embedding MATCH ?
+                    LIMIT ?
+                ) knn
+                JOIN memories m ON m.id = knn.rowid
+                WHERE 1=1
+            """
+            args = [blob, knn_limit]
+            for key in filter_keys:
                 sql += f" AND m.{key}=?"
-                args.append(v)
-        sql += " ORDER BY knn.distance ASC LIMIT ?"
-        args.append(top_k)
-        rows = self.conn.execute(sql, args).fetchall()
+                args.append(filters[key])
+            sql += " ORDER BY knn.distance ASC LIMIT ?"
+            args.append(top_k)
+            rows = self.conn.execute(sql, args).fetchall()
+            if len(rows) >= top_k or widen >= 2 or knn_limit >= min(_MAX_KNN_SCAN, _VEC0_K_MAX):
+                return [self._row_to_dict(r) for r in rows]
+            widen += 1
+            knn_limit = min(knn_limit * 8, _VEC0_K_MAX)
         return [self._row_to_dict(r) for r in rows]
 
     def keyword_search(self, query: str, top_k: int = 5, filters: dict | None = None) -> list[dict]:
