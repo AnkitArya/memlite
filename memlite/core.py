@@ -9,10 +9,52 @@ Design notes (lean on purpose):
 """
 import os
 import re
+import time
 import uuid
 
 from .embedder import Embedder
 from .store import Store
+
+# Recency weighting for hybrid search (mirrors mem0's recency weighting idea):
+# score = rrf_score * (RECENCY_BASE + (1-RECENCY_BASE) * decay), where decay
+# halves every DECAY_HALF_LIFE_DAYS since last update.
+DECAY_HALF_LIFE_DAYS = 30.0
+RECENCY_BASE = 0.5
+
+
+def _age_days(iso_ts: str | None, now: float) -> float | None:
+    if not iso_ts:
+        return None
+    try:
+        if iso_ts.endswith("Z"):
+            iso_ts = iso_ts[:-1] + "+00:00"
+        import datetime as _dt
+        t = _dt.datetime.fromisoformat(iso_ts)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, now - t.timestamp()) / 86400.0
+    except (ValueError, TypeError):
+        return None
+
+
+_EXTRACT_PROMPT = """You extract durable, long-term memories from a conversation.
+
+Conversation:
+\"\"\"
+{conversation}
+\"\"\"
+
+Rules:
+- Extract ONLY facts worth remembering long-term (preferences, personal
+  details, decisions, skills, important events). Ignore small talk, questions,
+  transient states, and assistant filler.
+- Each memory must be a short, self-contained statement. Rewrite "I/my" as
+  "User". Never invent facts not present in the conversation.
+- If nothing is worth remembering, return an empty list.
+
+Return STRICTLY this JSON, no prose, no markdown fences:
+{{"memories": ["fact 1", "fact 2"]}}
+"""
 
 _RECONCILE_PROMPT = """You maintain a user's memory store. The user just made a statement.
 Your ONLY job is to reflect that statement into the memory store as exactly ONE
@@ -243,33 +285,88 @@ class Memory:
         if not texts:
             return {"results": []}
 
-        # LLM reconcile: opt-in only.
-        if infer and reconcile_with_llm and self._llm_client:
-            return self._reconcile_add(
+        # Raw path (infer=False): plain ADD, one transaction, batch embeddings.
+        if not infer:
+            return self._raw_add(
                 texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
                 metadata=metadata, memory_type=memory_type,
             )
 
-        # Deterministic reconcile (no LLM): the default for infer=True.
-        if infer:
-            return self._deterministic_reconcile(
-                texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
-                metadata=metadata, memory_type=memory_type,
-            )
+        # infer=True: 1) extract discrete facts from the conversation (LLM if
+        # available, otherwise the raw chunks are treated as already-extracted),
+        # 2) reconcile each extracted fact against the store (ADD/UPDATE/DELETE).
+        has_llm = self._llm_client is not None
+        # Retraction statements bypass extraction: the extractor would rephrase
+        # "Forget X" into a plain fact and the DELETE intent would be lost.
+        reclaimed = [t for t in texts if _is_retraction(t)]
+        normal = [t for t in texts if t not in reclaimed]
+        extracted = self._extract(normal) if (has_llm and normal) else []
+        if not extracted:
+            extracted = list(normal)  # never silently drop data
+        extracted.extend(reclaimed)
 
-        # Raw path (infer=False): plain ADD.
+        return self._reconcile_many(
+            extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
+            metadata=metadata, memory_type=memory_type,
+            use_llm=(has_llm and reconcile_with_llm),
+        )
+
+    def _raw_add(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
+        """Plain ADD path with batched embedding (one API call for N texts)."""
+        cleaned = [t.strip() for t in texts if t.strip()]
+        if not cleaned:
+            return {"results": []}
+        embs = self.embedder.embed_many(cleaned)
         results = []
-        for mem in texts:
-            mem = mem.strip()
-            if not mem:
-                continue
-            emb = self.embedder.embed(mem)
+        for mem, emb in zip(cleaned, embs):
             mid = self._store_get().insert(
                 mem, emb, user_id=user_id, agent_id=agent_id,
                 run_id=run_id, metadata=metadata, memory_type=memory_type,
             )
             results.append({"id": mid, "memory": mem, "event": "ADD"})
         return {"results": results}
+
+    def _reconcile_many(self, texts, *, user_id, agent_id, run_id, metadata,
+                        memory_type, use_llm=False):
+        if use_llm:
+            return self._reconcile_add(
+                texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
+                metadata=metadata, memory_type=memory_type,
+            )
+        return self._deterministic_reconcile(
+            texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
+            metadata=metadata, memory_type=memory_type,
+        )
+
+    def _extract(self, texts: list[str]) -> list[str]:
+        """LLM extraction pass: distill a conversation into discrete memories.
+
+        Mirrors mem0's fact extraction. Returns [] if no LLM or the call fails
+        (callers fall back to raw dedupe-by-heuristic — never drop data).
+        """
+        if self._llm_client is None:
+            return []
+        convo = "\n".join(f"user says: {t}" for t in texts)
+        prompt = _EXTRACT_PROMPT.format(conversation=convo)
+        try:
+            import json
+            r = self._llm_client.chat.completions.create(
+                model=self._llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+            )
+            # tolerate markdown fences / prose around the JSON block
+            m = re.search(r"\{.*\}", r.choices[0].message.content, re.S)
+            if not m:
+                return []
+            val = json.loads(m.group(0))
+            return [
+                str(f).strip()
+                for f in val.get("memories", [])
+                if isinstance(f, (str, dict)) and str(f).strip()
+            ]
+        except Exception:
+            return []
 
     def _deterministic_reconcile(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
         """No-LLM reconcile. Arithmetic decision over semantic + token overlap.
@@ -345,6 +442,12 @@ class Memory:
         if cos_ >= cos_update and _shared_bigrams(text, best_text):
             return {"event": "UPDATE", "id": best["id"], "cos": cos_,
                     "shared": sorted(_shared_bigrams(text, best_text))}
+
+        # Near-duplicate guard: a new text that is almost identical to an
+        # existing memory (cos >= 0.90) is treated as an UPDATE (in-place
+        # refresh) rather than a duplicate ADD — the store does not bloat.
+        if cos_ >= 0.90:
+            return {"event": "UPDATE", "id": best["id"], "cos": cos_}
 
         # ADD: everything else — including high-cosine + no shared bigram
         # (same entity, different fact) which must be kept as a separate memory.
@@ -422,7 +525,7 @@ class Memory:
     @staticmethod
     def _to_texts(messages) -> list[str]:
         if isinstance(messages, str):
-            return [{"role": "user", "content": messages}].__str__() and [messages]
+            return [messages]
         if isinstance(messages, dict):
             messages = [messages]
         texts = []
@@ -446,22 +549,42 @@ class Memory:
         if strategy == "keyword":
             rows = store.keyword_search(query, top_k=top_k, filters=filters)
             return [self._shape(r, "keyword") for r in rows]
-        # hybrid: semantic primary, keyword fills gaps, merged by score
+        # hybrid: RRF (reciprocal rank fusion) — rank-based, scale-free, the
+        # standard way to merge top-k lists from different scorers (bm25 rank
+        # and cosine similarity are not directly comparable; raw positions are).
         sem = store.semantic_search(qv, top_k=top_k * 2, filters=filters)
         kw = store.keyword_search(query, top_k=top_k * 2, filters=filters)
-        merged: dict[str, dict] = {}
-        for r in sem:
+        K = 60
+        rrf: dict[str, dict] = {}  # id -> shaped row with rrf_score
+        for rank, r in enumerate(sem):
             d = self._shape(r, "semantic")
-            merged[d["id"]] = d
-        for r in kw:
-            i = r["id"]
-            if i in merged:
-                merged[i]["score"] = 0.5 * merged[i]["score"] + 0.5 * (1.0 / (1.0 + abs(float(r.get("score") or 0))))
+            d["rrf_score"] = 1.0 / (K + rank + 1)
+            rrf[d["id"]] = d
+        for rank, r in enumerate(kw):
+            d = self._shape(r, "keyword")
+            contribution = 1.0 / (K + rank + 1)
+            if d["id"] in rrf:
+                rrf[d["id"]]["rrf_score"] += contribution
             else:
-                d = self._shape(r, "keyword")
-                merged[i] = d
-        sorted_items = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
-        return sorted_items[:top_k]
+                d["rrf_score"] = contribution
+                rrf[d["id"]] = d
+
+        # recency tie-breaker: newer memories beat older ones at equal RRF rank.
+        # score = rrf_score * (BASE + (1-BASE) * decay), decay halves every 30 days.
+        now = time.time()
+        items = list(rrf.values())
+        for d in items:
+            age = _age_days(d.get("updated_at"), now)
+            if age is None:
+                decay = 1.0
+            else:
+                decay = DECAY_HALF_LIFE_DAYS / (DECAY_HALF_LIFE_DAYS + age)
+            d["score"] = d.pop("rrf_score") * (
+                RECENCY_BASE + (1.0 - RECENCY_BASE) * decay
+            )
+
+        items.sort(key=lambda x: x["score"], reverse=True)
+        return items[:top_k]
 
     # ---------- reflect (hindsight-inspired synthesis) ----------
     def reflect(self, query: str, *, filters: dict | None = None, top_k: int = 5):

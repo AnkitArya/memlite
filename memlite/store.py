@@ -8,8 +8,10 @@ Tables (all in ONE db file, share a connection/WAL):
 """
 import json
 import math
+import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -64,7 +66,7 @@ class Store:
         self.db_path = db_path
         self.dims = dims
         self._lock = threading.Lock()
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = self._connect()
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -73,6 +75,26 @@ class Store:
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
         self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open the sqlite connection with retry on lock contention.
+
+        Multiple processes (or a second Store instance) may hold the write
+        lock; busy_timeout + a bounded retry turns 'database is locked' into
+        a wait instead of an error.
+        """
+        delay = 0.05
+        for attempt in range(6):
+            try:
+                conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5.0)
+                conn.execute("PRAGMA busy_timeout=5000")
+                return conn
+            except sqlite3.OperationalError:
+                if attempt == 5:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+        raise sqlite3.OperationalError("could not connect")
 
     # ---------- schema ----------
     def _init_schema(self):
@@ -195,13 +217,17 @@ class Store:
             if r is None:
                 return False
             row_id = r["id"]
+            old_text = cur.execute(
+                "SELECT memory FROM memories WHERE mem_id=?", (memory_id,)
+            ).fetchone()["memory"]
             cur.execute("DELETE FROM memories WHERE mem_id=?", (memory_id,))
             cur.execute("DELETE FROM memory_vectors WHERE rowid=?", (row_id,))
             cur.execute("DELETE FROM memories_fts WHERE id=?", (memory_id,))
             now = datetime.now(timezone.utc).isoformat()
             cur.execute(
-                "INSERT INTO history(id, memory_id, event, created_at) VALUES (?,?,?,?)",
-                (str(uuid.uuid4()), memory_id, "DELETE", now),
+                "INSERT INTO history(id, memory_id, old_memory, new_memory, event, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (str(uuid.uuid4()), memory_id, old_text, None, "DELETE", now),
             )
             self.conn.commit()
         return True
