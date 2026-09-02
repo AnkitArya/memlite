@@ -4,24 +4,7 @@
 > `python docs/render_diagrams.py` (mermaid-cli, optional) or paste a block
 > into any mermaid renderer.
 
-## 1. add(infer=False) — Raw ADD
-
-```mermaid
-sequenceDiagram
-    participant C as Caller
-    participant M as Memory
-    participant E as Embedder
-    participant S as Store (SQLite)
-    C->>M: add(messages, infer=False)
-    M->>M: _to_texts(messages)
-    M->>E: embed_many(texts)  %% batched, one API call
-    E-->>M: embeddings[]
-    M->>S: insert(mem, emb) x N
-    Note over S: one txn: memories + memory_vectors + memories_fts + history(ADD)
-    M-->>C: {"results": [{id, memory, event: ADD}]}
-```
-
-## 2. add(infer=True) — with LLM extraction + deterministic reconcile
+## 1. add() — LLM extraction + deterministic reconcile (the only path)
 
 ```mermaid
 sequenceDiagram
@@ -30,59 +13,41 @@ sequenceDiagram
     participant L as LLM
     participant E as Embedder
     participant S as Store
-    C->>M: add(messages, infer=True)
-    M->>M: _to_texts() + _is_retraction() per text
+    C->>M: add(messages)
+    M->>M: _to_texts(messages)
+    opt no LLM configured
+        M-->>C: ValueError (LLM is required for extraction)
+    end
+    M->>M: _is_retraction() per text
     Note over M: retraction statements bypass extraction (keep DELETE intent)
     M->>L: extract(normal texts)
     L-->>M: discrete facts[] (small talk dropped)
-    Note over M: extraction empty -> fall back to raw chunks (never drop data)
+    Note over M: extraction empty and no retractions -> raw texts become the facts
+    Note over M: ONE txn for all mutations below (begin -> ... -> commit)
+    M->>E: embed_many(facts)  %% batched, one API call
     loop per extracted fact
-        M->>E: embed(fact)
         M->>S: semantic_search(emb, top_k=5, scope)
         S-->>M: existing candidates
         M->>M: _decide(fact, emb, existing)
-        alt DELETE (retraction + cos>=0.65)
-            M->>S: delete(id) + history(DELETE, old_memory snapshot)
+        alt DELETE (retraction + cos>=0.82)
+            M->>S: delete(id, in_txn) + history(DELETE, old_memory snapshot)
             M-->>M: results += DELETE
         else UPDATE (cos>=0.65 + shared bigram) OR (cos>=0.90 dup guard)
-            M->>S: update_memory(id, text, emb) + history(UPDATE)
+            M->>S: update_memory(id, text, emb, in_txn) + history(UPDATE)
             M-->>M: results += UPDATE
         else ADD (everything else)
-            M->>S: insert(fact, emb) + history(ADD)
+            M->>S: insert(fact, emb, in_txn) + history(ADD)
             M-->>M: results += ADD
         end
     end
+    M->>S: commit (single fsync)
     M-->>C: {"results": [...]}
 ```
 
-## 3. add(infer=True, reconcile_with_llm=True) — LLM reconcile variant
+> The former raw-add (no LLM) and LLM-reconcile variants were removed:
+> exactly one add() path exists — LLM extraction + deterministic reconcile.
 
-> **Removed.** Reconcile is always deterministic (see flow 2). This section
-> documents the old opt-in that no longer exists; kept only so old links make
-> sense. Use flow 2 for all infer=True adds.
-
-```mermaid
-sequenceDiagram
-    participant C as Caller
-    participant M as Memory
-    participant L as LLM
-    participant S as Store
-    C->>M: add(messages, infer=True, reconcile_with_llm=True)
-    M->>L: extraction pass(facts only)
-    M->>E: embed(extracted)
-    M->>S: semantic_search top_k=8 in scope
-    S-->>M: existing memories with ids
-    M->>L: reconcile prompt (statement + existing ids)
-    L-->>M: {"memory": [event: ADD|UPDATE|DELETE, id?, text?]}
-    M->>M: validate: id must exist in retrieved set, else ignored
-    opt LLM returned nothing usable
-        M->>S: raw ADD fallback (never drop data)
-    end
-    M->>S: apply ops transactionally
-    M-->>C: {"results": [...]}
-```
-
-## 4. search — semantic / keyword / hybrid (RRF + recency)
+## 2. search — semantic / keyword / hybrid (RRF + recency)
 
 ```mermaid
 sequenceDiagram
@@ -107,7 +72,7 @@ sequenceDiagram
     end
 ```
 
-## 5. update / delete / delete_all / get_all (admin surface)
+## 3. update / delete / delete_all / get_all (admin surface)
 
 ```mermaid
 sequenceDiagram
@@ -128,7 +93,7 @@ sequenceDiagram
     M->>S: list_all -> shaped rows
 ```
 
-## 6. reflect(query) — recall + synthesis
+## 4. reflect(query) — recall + synthesis
 
 ```mermaid
 sequenceDiagram
@@ -148,7 +113,7 @@ sequenceDiagram
     end
 ```
 
-## 7. Concurrency / locking
+## 5. Concurrency / locking
 
 ```mermaid
 sequenceDiagram

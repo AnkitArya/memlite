@@ -1,44 +1,22 @@
 ---
-title: MemLite add() — deterministic reconcile (no LLM by default)
+title: "MemLite add() — LLM extraction (required) + deterministic reconcile"
 ---
 flowchart TD
-    A["m.add(text, …)<br/>user_id · infer · memory_type"] --> B["_to_texts()<br/>str | messages → list[str]"]
+    A["m.add(text, …)<br/>user_id · memory_type"] --> B["_to_texts()<br/>str | messages → list[str]"]
+    B --> NO[/"no LLM configured?"/]
+    NO -->|yes| ER(["ValueError — LLM required for extraction"])
 
-    %% ---- raw lane: infer=False ----
-    B -->|"infer=False (raw)"| C["embed(text)"]
-    C --> D["INSERT memories + vec + FTS<br/>one transaction · history row"]
-    D --> E(["event: ADD"])
-
-    %% ---- deterministic lane (default) ----
-    B -->|"infer=True (default)"| F["embed(text)"]
+    B -->|"LLM configured (the only path)"| P["LLM extraction pass<br/>discrete durable facts<br/>(retractions bypass extraction —<br/>DELETE intent preserved)"]
+    P --> F["embed_many(facts)<br/>one batched API call"]
     F --> G["semantic_search top-5 in scope<br/>vec0 · distance_metric=cosine<br/>(was silent L2 — fixed)"]
-    G --> H{"_decide()<br/>pure fn · 10 unit tests"}
-
-    %% ---- extraction lane (LLM, default when configured) ----
-    B -.->|"infer=True + LLM configured: extraction pass"| P["LLM distills conversation<br/>discrete durable facts<br/>(retractions bypass extraction)"]
-    P --> F["embed each fact"]
+    G --> H{"_decide()<br/>pure fn · unit tests"}
 
     %% ---- _decide outcomes ----
-    H -->|"retraction intent + cos ≥ 0.65"| DEL["DELETE<br/>&quot;forget / no longer&quot; regex<br/>+ &quot;don't forget&quot; negation guard"]
-    H -->|"cos ≥ 0.65 AND shared content-bigram"| UPD["UPDATE — same claim, new value<br/>attribute key phrase survives<br/>(&quot;favorite color&quot;) · same id kept"]
+    H -->|"retraction intent + cos ≥ 0.82"| DEL["DELETE<br/>&quot;forget / no longer&quot; regex<br/>+ &quot;don't forget&quot; negation guard<br/>(0.82: destructive bar)"]
+    H -->|"cos ≥ 0.65 AND shared content-bigram<br/>OR cos ≥ 0.90 duplicate guard"| UPD["UPDATE — same claim, new value<br/>attribute key phrase survives<br/>(&quot;favorite color&quot;) · same id kept"]
     H -->|"else"| ADD(["ADD — conservative default<br/>wrong ADD = duplicate ·<br/>wrong UPDATE/DELETE = data loss"])
 
     %% ---- store ----
-    DEL --> S
+    DEL --> S["one SQLite transaction<br/>memories + vec0 + FTS5 + history<br/>(BEGIN IMMEDIATE → COMMIT, single fsync)"]
     UPD --> S
     ADD --> S
-    Q --> S
-    S["Store — one SQLite file (WAL)<br/>memories · memory_vectors (vec0, cosine) · memories_fts (FTS5) · history (audit)"]
-
-    classDef lane fill:#f8fafc,stroke:#4a6cf7,color:#1e2430;
-    classDef llm fill:#ede9fe,stroke:#8b5cf6,color:#5b21b6;
-    classDef del fill:#fef3c7,stroke:#d97706,color:#92400e;
-    classDef upd fill:#e0e7ff,stroke:#4a6cf7,color:#1e3a8a;
-    classDef add fill:#dcfce7,stroke:#16a34a,color:#14532d;
-    classDef store fill:#1e2430,stroke:#1e2430,color:#fff;
-    class C,D,E,F,G lane;
-    class P,P2,Q llm;
-    class DEL del;
-    class UPD upd;
-    class ADD,E add;
-    class S store;

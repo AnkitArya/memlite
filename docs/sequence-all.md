@@ -16,40 +16,34 @@ sequenceDiagram
 
     %% ============ WRITE: add() ============
     rect rgb(235,244,255)
-    C->>M: add(messages, infer=)
+    C->>M: add(messages)
     M->>M: _to_texts(messages) -> texts[]
-    alt infer=False (raw chunks)
-        M->>E: embed_many(texts)   [one batched API call]
-        E-->>M: embeddings[]
-        loop per (text, emb)
-            M->>S: insert(text, emb)
-            Note over S: 1 txn: memories + memory_vectors + memories_fts + history[ADD]
-        end
-        M-->>C: {results: [ADD...]}
-    else infer=True — extraction + reconcile
+    alt no LLM configured
+        M-->>C: ValueError (LLM required for extraction pass)
+    else extraction + deterministic reconcile (the only path)
         M->>M: split: retractions (_is_retraction) vs normal
-        opt LLM configured (extraction only — reconcile stays deterministic)
-            M->>L: extract(normal texts)
-            L-->>M: discrete durable facts (filler dropped)
-            Note over M: empty extraction -> fallback to raw chunks (never drop data)
-        end
+        M->>L: extract(normal texts)   [extraction only — reconcile stays deterministic]
+        L-->>M: discrete durable facts (filler dropped)
+        Note over M: empty extraction and no retractions -> raw texts become the facts
         Note over M: retraction statements kept verbatim (DELETE intent preserved)
+        Note over M: ONE txn for all mutations (begin -> ... -> commit, single fsync)
+        M->>E: embed_many(facts)   [one batched API call]
         loop per fact / statement
-            M->>E: embed(text)
             M->>S: semantic_search(emb, top_k, scope)
             S-->>M: existing candidates
             M->>M: _decide(text, emb, existing)
-            alt DELETE: retraction intent AND cos>=0.65 match
-                M->>S: delete(id) + history[DELETE, old_memory snapshot]
+            alt DELETE: retraction intent AND cos>=0.82 match
+                M->>S: delete(id, in_txn) + history[DELETE, old_memory snapshot]
                 M-->>C: event DELETE
             else UPDATE: cos>=0.65 AND shared content-bigram, OR cos>=0.90 duplicate guard
-                M->>S: update_memory(id, text, emb) + history[UPDATE]
+                M->>S: update_memory(id, text, emb, in_txn) + history[UPDATE]
                 M-->>C: event UPDATE (same id)
             else ADD: everything else (conservative)
-                M->>S: insert(text, emb) + history[ADD]
+                M->>S: insert(text, emb, in_txn) + history[ADD]
                 M-->>C: event ADD
             end
         end
+        M->>S: commit
         M-->>C: {results: [...]}
     end
     end

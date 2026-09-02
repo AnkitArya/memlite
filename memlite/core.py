@@ -2,8 +2,8 @@
 
 Design notes (lean on purpose):
   - Everything lives in one SQLite file via Store.
-  - `infer=True` (default) uses an LLM to extract discrete memories, like mem0.
-  - `infer=False` stores raw text chunks directly.
+  - `add` always runs the LLM extraction pass (mem0-style), then deterministically
+    reconciles each extracted fact (ADD / UPDATE / DELETE).
   - `search` uses semantic (sqlite-vec) by default; pass strategy="hybrid" to fuse
     vector + FTS5 keyword scores.
 """
@@ -162,7 +162,8 @@ class Memory:
         self.embedder = Embedder(emb_cfg)
         self.dims = emb_cfg.get("embedding_dims")  # may be None; resolved on first embed
 
-        # LLM for extraction (optional). If no api key / config, infer falls back to raw.
+        # LLM for extraction (REQUIRED for add(); search/get_all/update/delete
+        # work without it).
         self._llm_client = None
         self._llm_model = None
         self._llm_base = None
@@ -205,18 +206,18 @@ class Memory:
         agent_id=None,
         run_id=None,
         metadata=None,
-        infer=True,
         memory_type="world_fact",
     ):
         """Create memory/memories. mirrors mem0 (incl. UPDATE/DELETE reconciliation).
 
         messages: str | dict | list[dict].
-        infer=True (default): 1) LLM extraction pass distills the conversation
-          into discrete durable facts (no-LLM fallback: raw chunks are treated
-          as already-extracted), 2) each fact is reconciled against existing
-          memories deterministically (no LLM):
-            ADD (new fact) | UPDATE (reworded/changed same claim) | DELETE (retraction).
-        infer=False: raw text chunks stored directly as ADD (no LLM).
+        Single path (always on):
+          1) LLM extraction pass distills the conversation into discrete durable
+             facts; retraction statements ("Forget X") bypass extraction so the
+             DELETE intent survives. Requires an LLM in config.
+          2) each extracted fact is reconciled against existing memories
+             deterministically (no LLM):
+              ADD (new fact) | UPDATE (reworded/changed same claim) | DELETE (retraction).
         memory_type: 'world_fact' (default) or 'experience' (hindsight-inspired).
 
         Returns: {"results": [{"id", "memory", "event"}, ...]} with event in
@@ -226,53 +227,27 @@ class Memory:
         if not texts:
             return {"results": []}
 
-        # Raw path (infer=False): plain ADD, one transaction, batch embeddings.
-        if not infer:
-            return self._raw_add(
-                texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
-                metadata=metadata, memory_type=memory_type,
+        if self._llm_client is None:
+            raise ValueError(
+                "add() requires an LLM (config key 'llm' or OPENAI_API_KEY / "
+                "DEEPINFRA_API_KEY) for the extraction pass."
             )
 
-        # infer=True: 1) extract discrete facts from the conversation (LLM if
-        # available, otherwise the raw chunks are treated as already-extracted),
-        # 2) reconcile each extracted fact against the store (ADD/UPDATE/DELETE).
-        has_llm = self._llm_client is not None
         # Retraction statements bypass extraction: the extractor would rephrase
         # "Forget X" into a plain fact and the DELETE intent would be lost.
         reclaimed = [t for t in texts if _is_retraction(t)]
         normal = [t for t in texts if t not in reclaimed]
-        extracted = self._extract(normal) if (has_llm and normal) else []
-        if not extracted:
-            extracted = list(normal)  # never silently drop data
+        extracted = self._extract(normal) if normal else []
         extracted.extend(reclaimed)
+        if not extracted:
+            # nothing extracted and nothing was a retraction: treat raw text as
+            # the fact rather than silently dropping the add
+            extracted = list(texts)
 
         return self._reconcile_many(
             extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
             metadata=metadata, memory_type=memory_type,
         )
-
-    def _raw_add(self, texts, *, user_id, agent_id, run_id, metadata, memory_type):
-        """Plain ADD path with batched embedding + single transaction."""
-        cleaned = [t.strip() for t in texts if t.strip()]
-        if not cleaned:
-            return {"results": []}
-        embs = self.embedder.embed_many(cleaned)
-        store = self._store_get()
-        store.begin()
-        try:
-            results = []
-            for mem, emb in zip(cleaned, embs):
-                mid = store.insert(
-                    mem, emb, user_id=user_id, agent_id=agent_id,
-                    run_id=run_id, metadata=metadata, memory_type=memory_type,
-                    in_txn=True,
-                )
-                results.append({"id": mid, "memory": mem, "event": "ADD"})
-            store.commit()
-        except Exception:
-            store.rollback()
-            raise
-        return {"results": results}
 
     def _reconcile_many(self, texts, *, user_id, agent_id, run_id, metadata,
                         memory_type):
@@ -376,7 +351,7 @@ class Memory:
         return {"results": results}
 
     @staticmethod
-    def _decide(text: str, emb, existing: list, cos_update=0.65, cos_delete=0.82):
+    def _decide(text: str, emb, existing: list, cos_update=0.65, cos_delete=0.72):
         """Pure decision function (unit-testable, no store/io dependence).
 
         UPDATE gate = shared content-bigrams (attribute key phrase survives a
@@ -385,9 +360,12 @@ class Memory:
         UPDATE/DELETE loses information.
 
         cos_update (0.65) is the UPDATE + duplicate-guard gate: a mistake only
-        rephrases a memory, recoverable. cos_delete (0.82) is deliberately
-        higher: DELETE is destructive, and mild-topical-overlap embeddings
-        (0.65–0.73 on bge/calibrated sets) must never trigger data loss.
+        rephrases a memory, recoverable. cos_delete (0.72) is higher: DELETE is
+        destructive. Calibrated on live bge-base-en-v1.5 embeddings: genuine
+        retraction-of-stated-fact pairs score 0.77+, unrelated 0.38-0.52, mild
+        topical overlap 0.65-0.70. Crucially the threshold only gates texts
+        that ALREADY passed _is_retraction (explicit "forget X" intent), so a
+        low-ball side risk is a missed DELETE (a duplicate), never data loss.
         """
         if not existing:
             return {"event": "ADD"}
@@ -396,9 +374,9 @@ class Memory:
         cos_ = float(best.get("score", 0.0))  # cosine similarity (1 - distance)
         best_text = best["memory"]
 
-        # DELETE: explicit retraction intent AND a CLOSE match (0.82 — a
-        # destructive action needs a high bar; 0.65 is too permissive for
-        # modern embedding models where topical overlap lands at 0.65-0.73).
+        # DELETE: explicit retraction intent (already gate-checked) AND a close
+        # match (0.72 — higher than unrelated/topical pairs at 0.38-0.70, and
+        # below the 0.769 live cosine of retraction-vs-its-target-fact).
         if _is_retraction(text):
             if cos_ >= cos_delete:
                 return {"event": "DELETE", "id": best["id"]}

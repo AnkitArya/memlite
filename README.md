@@ -47,7 +47,7 @@ m = Memory({
 }, db_path="memlite.db")
 
 m.add("User loves spicy Indian food", user_id="alice")
-m.add([{"role": "user", "content": "my favorite color is teal"}], user_id="alice", infer=False)
+m.add("User's favorite color is teal", user_id="alice")
 
 hits = m.search("what does alice like to eat?", filters={"user_id": "alice"})
 
@@ -56,16 +56,18 @@ m.update("User loves spicy Thai food", memory_id=hits[0]["id"])
 m.delete(memory_id=hits[0]["id"])
 ```
 
-`infer=True` (default) now mirrors mem0's two-pass pipeline. **Pass 1 (extraction)**:
-if an LLM is configured, the conversation is distilled into discrete, durable
-facts — small talk, questions and assistant filler are dropped. Statements with
-retraction intent ("Forget X") bypass extraction so the DELETE signal survives.
-**Pass 2 (reconcile)**: each extracted fact is reconciled against existing
-memories **deterministically — with arithmetic, no LLM call**: retrieve the
+`add()` always runs mem0's two-pass pipeline (there is no `infer` flag — LLM
+extraction is the only path). **Pass 1 (extraction)**: the conversation is
+distilled into discrete, durable facts — small talk, questions and assistant
+filler are dropped. Statements with retraction intent ("Forget X") bypass
+extraction so the DELETE signal survives. **Pass 2 (reconcile)**: each
+extracted fact is reconciled against existing memories
+**deterministically — with arithmetic, no LLM call**: retrieve the
 top semantically similar memories in scope, then decide
 
 - **DELETE** — the text carries explicit retraction intent ("forget X", "no
-  longer ...") *and* closely matches an existing memory (cosine ≥ 0.65)
+  longer ...") *and* closely matches an existing memory (cosine ≥ 0.82 —
+  destructive actions need a high bar)
 - **UPDATE** — cosine ≥ 0.65 **and** the pair shares a content-word bigram
   (the attribute key phrase — "favorite color", "works as" — survives a value
   change, while a *different* fact about the same entity shares none), or
@@ -77,8 +79,8 @@ top semantically similar memories in scope, then decide
   Bangalore") stores as a duplicate ADD rather than an in-place update.
 
 ```python
-m.add("My favorite color is teal", user_id="alice", infer=False)
-m.add("Actually, my favorite color changed to magenta now", user_id="alice", infer=True)
+m.add("My favorite color is teal", user_id="alice")
+m.add("Actually, my favorite color changed to magenta now", user_id="alice")
 # → [{"id": "<teal-id>", "memory": "...magenta...", "event": "UPDATE"}]
 
 m.add("Forget that I said I love pineapple on pizza", user_id="alice")
@@ -87,9 +89,9 @@ m.add("Forget that I said I love pineapple on pizza", user_id="alice")
 
 The LLM's only role is **extraction** (pass 1). The ADD/UPDATE/DELETE decision
 (pass 2) is always the deterministic arithmetic rule — no LLM call, no prompt
-injection surface, no provider dependency in the write path. If the LLM is
-unavailable, extraction falls back to the raw chunks — `add` never silently
-drops information.
+injection surface, no provider dependency in the reconcile path. An LLM is
+**required** for `add()` (it raises `ValueError` without one); `search`,
+`get_all`, `update`, `delete` work without it.
 
 ### Hindsight-inspired additions
 

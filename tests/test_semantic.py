@@ -39,12 +39,13 @@ if os.path.exists(DB):
 def build_memory():
     return Memory(
         {
+            "llm": {"config": {"model": "deepseek-ai/DeepSeek-V3"}},
             "embedder": {
                 "config": {
                     "model": "BAAI/bge-base-en-v1.5",
                     "openai_base_url": "https://api.deepinfra.com/v1/openai",
                 }
-            }
+            },
         },
         db_path=DB,
     )
@@ -102,7 +103,7 @@ def test_hybrid_and_roundtrip():
     print("\nRound-trip update/delete OK")
 
 
-def test_infer_false_raw_chunks():
+def test_add_requires_llm():
     m = Memory(
         {"embedder": {"config": {"model": "BAAI/bge-base-en-v1.5",
                                  "openai_base_url": "https://api.deepinfra.com/v1/openai"}}},
@@ -110,13 +111,13 @@ def test_infer_false_raw_chunks():
     )
     if os.path.exists("/tmp/memlite_test2.db"):
         os.remove("/tmp/memlite_test2.db")
-    r = m.add([{"role": "user", "content": "my dog is named Rufus"}],
-              user_id="carol", infer=False)
-    assert len(r["results"]) == 1
-    assert "Rufus" in r["results"][0]["memory"]
-    sr = m.search("what is the dog's name", filters={"user_id": "carol"})
-    assert sr and "Rufus" in sr[0]["memory"]
-    print("\nRaw add + search OK:", sr[0]["memory"])
+    try:
+        m.add([{"role": "user", "content": "my dog is named Rufus"}], user_id="carol")
+        assert False, "add() without an LLM must raise"
+    except ValueError as e:
+        assert "requires an LLM" in str(e)
+    print("\nadd() without LLM raises ValueError as designed")
+    m.close()
 
 
 def test_memory_type_and_reflect():
@@ -131,8 +132,9 @@ def test_memory_type_and_reflect():
         },
         db_path=db,
     )
-    m.add("The sky is blue on clear days", user_id="sam", infer=False, memory_type="world_fact")
-    m.add("I visited the Taj Mahal last Tuesday", user_id="sam", infer=False, memory_type="experience")
+    # seed facts as already-extracted durable statements through the standard path
+    m.add("The sky is blue on clear days", user_id="sam", memory_type="world_fact")
+    m.add("User visited the Taj Mahal last Tuesday", user_id="sam", memory_type="experience")
 
     # memory_type filtering
     gg = m.get_all(filters={"user_id": "sam", "memory_type": "experience"})
@@ -169,11 +171,12 @@ def test_reconcile_update_delete():
         db_path=db,
     )
 
-    # seed a fact (raw add, no LLM)
-    seed = m.add("My favorite color is teal", user_id="recon", infer=False)
+    # seed a fact through the standard path (LLM extraction is a pass-through
+    # for already-durable statements)
+    seed = m.add("My favorite color is teal", user_id="recon")
     seed_id = seed["results"][0]["id"]
 
-    # UPDATE: user changes their mind; infer=True + LLM should reconcile
+    # UPDATE: user changes their mind; deterministic reconcile should detect it
     upd = m.add("Actually, my favorite color changed to magenta now",
                 user_id="recon")
     events = {r["event"] for r in upd["results"]}
@@ -187,7 +190,7 @@ def test_reconcile_update_delete():
     assert seed_id in remain_ids, "UPDATE should keep the same memory id"
 
     # DELETE: user retracts another fact
-    m.add("I love pineapple on pizza", user_id="recon", infer=False)
+    m.add("User loves pineapple on pizza", user_id="recon")
     dl = m.add("Forget that I said I love pineapple on pizza", user_id="recon")
     dl_events = {r["event"] for r in dl["results"]}
     print("Reconcile DELETE events:", dl_events)
@@ -202,7 +205,7 @@ if __name__ == "__main__":
     test_semantic_search_returns_relevant_memories()
     test_keyword_fallback()
     test_hybrid_and_roundtrip()
-    test_infer_false_raw_chunks()
+    test_add_requires_llm()
     test_memory_type_and_reflect()
     test_reconcile_update_delete()
     print("\nALL TESTS PASSED")
