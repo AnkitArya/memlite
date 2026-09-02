@@ -337,6 +337,23 @@ class Memory:
             raise
         return {"results": results}
 
+    def add_raw(self, text: str, *, user_id=None, agent_id=None, run_id=None,
+                metadata=None, memory_type="world_fact") -> dict:
+        """Store an ALREADY-EXTRACTED durable fact — no LLM extraction pass.
+
+        For programmatic callers that hold a discrete fact statement (tool
+        calls, mirroring, imports) and must not pay for (or depend on) the
+        extraction LLM. Still reconciles deterministically against existing
+        memories (ADD/UPDATE/DELETE) and retracts work.
+        """
+        cleaned = [t.strip() for t in [text] if t and t.strip()]
+        if not cleaned:
+            return {"results": []}
+        return self._reconcile_many(
+            cleaned, user_id=user_id, agent_id=agent_id, run_id=run_id,
+            metadata=metadata, memory_type=memory_type,
+        )
+
     @staticmethod
     def _decide(text: str, emb, existing: list, cos_update=0.65, cos_delete=0.72):
         """Pure decision function (unit-testable, no store/io dependence).
