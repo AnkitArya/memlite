@@ -22,12 +22,15 @@ sequenceDiagram
     HV-->>C: <relevant_user_memories> (if cache non-empty)
     C->>HV: sync_turn(user_msg, assistant_msg)
     Note over HV: spawns daemon thread, non-blocking, primary context only
-    HV-->>M: add(messages) in worker (async)
+    HV->>M: add(messages) via worker thread (async, fire-and-forget)
+    M-)HV: worker continues: speculative hybrid search
+    Note over HV: worker fills _prefetch_cache for turn N+1
+    Note over HV: circuit breaker: 5 consecutive failures -> 2 min backoff
     end
 
     %% ==================== WRITE: add() ====================
     rect rgb(235,244,255)
-    note over C,S: add(messages) — the only write path
+    note over C,S: add(messages) — the only write path.<br/>Caller is C when used as a standalone library, HV's worker thread when running under Hermes
     C->>M: add(messages)
     M->>M: _to_texts(messages) -> texts[]
     alt no LLM configured
@@ -97,6 +100,7 @@ sequenceDiagram
     note over C,L: reflect(query), needs LLM, never blocks recall
     C->>M: reflect(query, filters)
     M->>E: embed(query)
+    E-->>M: query_emb
     M->>S: hybrid search (RRF)
     S-->>M: memories
     alt no hits OR LLM call fails
