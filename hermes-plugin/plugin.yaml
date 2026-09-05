@@ -1,0 +1,11 @@
+name: memlite
+version: 0.1.0
+description: "MemLite — single-file SQLite semantic memory (sqlite-vec + FTS5 hybrid RRF recall, LLM fact extraction, deterministic reconcile)."
+pip_dependencies:
+  - openai
+  - sqlite-vec
+hooks:
+  - sync_turn
+  - queue_prefetch
+  - on_session_end
+  - on_pre_compress
