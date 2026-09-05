@@ -67,12 +67,17 @@ _ADD_SCHEMA = {
     "description": (
         "Copy an already-durable fact statement into MemLite long-term memory "
         "(no LLM extraction pass — the fact should be a clean, self-contained "
-        "statement like 'User prefers snake_case in Python')."
+        "statement like 'User prefers snake_case in Python'). Optionally pass "
+        "aliases: 2-4 closely-related retrieval terms (synonyms/super-categor"
+        "ies, e.g. horoscope↔zodiac) so differently-phrased future queries "
+        "still recall this fact."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "fact": {"type": "string", "description": "Discrete durable fact statement"},
+            "aliases": {"type": "array", "items": {"type": "string"},
+                         "description": "2-4 related retrieval terms (synonyms/associated vocabulary)"},
         },
         "required": ["fact"],
     },
@@ -333,7 +338,8 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 fact = (args.get("fact") or "").strip()
                 if not fact:
                     return json.dumps({"error": "empty fact"})
-                r = self._mem.add_raw(fact, user_id=self._user_scope())
+                r = self._mem.add_raw(fact, user_id=self._user_scope(),
+                                      aliases=args.get("aliases"))
                 out = [{k: v for k, v in x.items() if k != "embedding"}
                        for x in r.get("results", [])]
                 return json.dumps({"ok": True, "results": out})
