@@ -425,11 +425,19 @@ class Memory:
         best_text = best["memory"]
 
         # DELETE: explicit retraction intent (already gate-checked) AND a close
-        # match (0.72 — higher than unrelated/topical pairs at 0.38-0.70, and
-        # below the 0.769 live cosine of retraction-vs-its-target-fact).
+        # match. Primary gate is cosine >= 0.72. Fallback gate: strong LEXICAL
+        # overlap with the stored fact (shared content-bigrams, case where
+        # phrasing style drags cosine below threshold — e.g. long polite
+        # wrappers "Please forget that I..." drop the cosine to ~0.6 even when
+        # the claim is exactly the retracted one). Lexical confirmation also
+        # prevents accidental deletes of loosely-tangent facts.
         if _is_retraction(text):
             if cos_ >= cos_delete:
                 return {"event": "DELETE", "id": best["id"]}
+            shared = _shared_bigrams(text, best_text)
+            if shared:
+                return {"event": "DELETE", "id": best["id"], "cos": cos_,
+                        "shared": sorted(shared)}
             # retraction intent but no close match: nothing to retract -> ADD no-op
             return {"event": "ADD"}
 
