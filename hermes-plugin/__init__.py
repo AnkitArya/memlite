@@ -189,7 +189,18 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context") or "primary"
-        self._hermes_home = Path(kwargs.get("hermes_home") or Path.home() / ".hermes")
+        home = (kwargs.get("hermes_home")
+                or getattr(self, "_hermes_home", None)
+                or os.environ.get("HERMES_HOME"))
+        if home:
+            self._hermes_home = Path(home)
+        else:
+            # mirror hermes_constants resolution: profile-aware default
+            try:
+                from hermes_constants import get_hermes_home
+                self._hermes_home = get_hermes_home()
+            except Exception:
+                self._hermes_home = Path.home() / ".hermes"
         db_path = self._config.get("db_path") or str(self._hermes_home / "memlite.db")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._mem = _build_memory(self._config, db_path)
@@ -295,6 +306,17 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         return [_SEARCH_SCHEMA, _ADD_SCHEMA, _FORGET_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        import json
+        if self._mem is None:
+            # initialize() not run in this process (or failed) — tool calls
+            # would crash with NoneType; report it structurally instead.
+            try:
+                self.initialize(getattr(self, "_session_id", "") or "tool-fallback",
+                                platform="tool-call")
+            except Exception as e:
+                return json.dumps({"error": f"memlite not initialized: {e}"})
+            if self._mem is None:
+                return json.dumps({"error": "memlite not initialized"})
         scope = {"user_id": self._user_scope()}
         try:
             if tool_name == "memlite_search":
@@ -311,7 +333,7 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 fact = (args.get("fact") or "").strip()
                 if not fact:
                     return json.dumps({"error": "empty fact"})
-                r = self._mem.add_raw(fact)
+                r = self._mem.add_raw(fact, user_id=self._user_scope())
                 out = [{k: v for k, v in x.items() if k != "embedding"}
                        for x in r.get("results", [])]
                 return json.dumps({"ok": True, "results": out})
