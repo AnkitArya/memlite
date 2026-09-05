@@ -66,17 +66,19 @@ extracted fact is reconciled against existing memories
 top semantically similar memories in scope, then decide
 
 - **DELETE** — the text carries explicit retraction intent ("forget X", "no
-  longer ...") *and* closely matches an existing memory (cosine ≥ 0.82 —
-  destructive actions need a high bar)
+  longer ...") *and* close match, on **either** signal: cosine ≥ 0.72, or
+  shared content-bigrams with the stored fact (lexical-confirmation fallback
+  — handles polite phrasings like "Please forget that I..." whose cosine
+  drops to ~0.6 even when the claim is exactly the retracted one)
 - **UPDATE** — cosine ≥ 0.65 **and** the pair shares a content-word bigram
   (the attribute key phrase — "favorite color", "works as" — survives a value
-  change, while a *different* fact about the same entity shares none), or
-  cosine ≥ 0.90 (near-duplicate guard: reworded re-adds refresh in place
-  instead of bloating the store)
+  change, while a *different* fact about the same entity shares none)
+- **Near-duplicate guard** — cosine ≥ 0.90 for plain facts, or ≥ 0.80 when the
+  incoming fact carries **aliases** (alias-appended embeddings score ~0.05
+  lower; the scoped threshold offsets that), refreshes the row in place
+  instead of adding a sibling
 - **ADD** — everything else. Conservative default: a wrong ADD is a duplicate,
-  a wrong UPDATE/DELETE loses information. Known conservative miss: a value
-  change with *no* lexical residue ("lives in Hyderabad" → "moved to
-  Bangalore") stores as a duplicate ADD rather than an in-place update.
+  a wrong UPDATE/DELETE loses information.
 
 ```python
 m.add("My favorite color is teal", user_id="alice")
@@ -87,8 +89,21 @@ m.add("Forget that I said I love pineapple on pizza", user_id="alice")
 # → [{"id": "<pineapple-id>", "memory": None, "event": "DELETE"}]
 
 # programmatic fact (already extracted by you — no LLM extraction pass):
-m.add_raw("User prefers snake_case in Python", user_id="alice")
+m.add_raw("User prefers snake_case in Python", user_id="alice",
+          aliases=["code style"])  # aliases optionally boost recall
 ```
+
+**Write-time aliasing (related-term recall).** The extractor also returns
+2–4 *related retrieval terms* per fact — synonyms, super-categories, or
+associated vocabulary (a fact about your zodiac sign gets `["horoscope",
+"astrology", "sun sign"]`). These are stored in `memories.aliases`, indexed
+into the FTS5 corpus, and folded into the embedding (clean text stays in
+`memories`), so a differently-phrased future query ("whats my horoscope")
+recalls a fact written with different vocabulary ("zodiac sign"). A small
+static synonym map adds the same bridge for facts created without aliases
+(tool calls, imports). This is the classic "lexical-or hole" fix, done at
+write time — search stays LLM-free. An illustrative miss this closed: store
+`"My zodiac sign is Gemini…"` then ask *"What's my horoscope?"* → now recalls.
 
 ### Hermes Agent plugin
 
@@ -138,7 +153,10 @@ rank-based and scale-free, unlike a raw bm25/cosine blend — then applies a
 **recency decay** tie-breaker (`score *= 0.5 + 0.5 * 30/(30 + age_days)`), so a
 newer, contradicting memory outranks the stale one it replaced. See
 [docs/sequence-all.md](docs/sequence-all.md) for the single UML sequence
-diagram covering every flow (plus decision thresholds and failure semantics).
+diagram covering every flow (plus decision thresholds and failure
+semantics), and [docs/test-report.md](docs/test-report.md) for the full
+T1–T10 architecture test matrix (33/36 live checks, incl. the exact
+horoscope↔zodiac recall case and the multi-mutation atomic-batch turn).
 
 ## Config knobs
 
