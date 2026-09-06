@@ -120,6 +120,7 @@ class Store:
             self._migrate_aliases(cur)
             self._ensure_vec_table(cur)
             cur.executescript(_SCHEMA_FTS)
+            self._ensure_fts_schema(cur)
             cur.executescript(_SCHEMA_HISTORY)
             self.conn.commit()
 
@@ -130,6 +131,34 @@ class Store:
         cols = {r[1] for r in cur.execute("PRAGMA table_info(memories)").fetchall()}
         if "aliases" not in cols:
             cur.execute(_SCHEMA_MIGRATE_ALIASES)
+
+    def _ensure_fts_schema(self, cur):
+        """Idempotent: ensure memories_fts carries the aliases column.
+
+        FTS5 virtual tables cannot be ALTERed to add a column, and
+        `CREATE VIRTUAL TABLE IF NOT EXISTS ... USING fts5(..., aliases)`
+        is a no-op when a table already exists with the older schema
+        `fts5(id UNINDEXED, memory)`. Pre-alias stores (created before the
+        write-time alias feature) therefore fail every index insert with
+        "table memories_fts has no column named aliases". Rebuild in place,
+        preserving the mem_id/memory corpus — same pattern as the vec
+        rebuild in _ensure_vec_table."""
+        meta = cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+        ).fetchone()
+        if meta is not None and "aliases" in (meta["sql"] or ""):
+            return  # current schema, nothing to do
+        # snapshot current corpus (mem_id -> memory+aliases) before rebuild
+        rows = cur.execute(
+            "SELECT mem_id, memory, aliases FROM memories"
+        ).fetchall()
+        cur.execute("DROP TABLE IF EXISTS memories_fts")
+        cur.executescript(_SCHEMA_FTS)
+        for r in rows:
+            cur.execute(
+                "INSERT INTO memories_fts(id, memory, aliases) VALUES (?,?,?)",
+                (r["mem_id"], r["memory"], r["aliases"] or ""),
+            )
 
     def _ensure_vec_table(self, cur):
         """Create the vec0 table, or rebuild it if a legacy copy used L2.
