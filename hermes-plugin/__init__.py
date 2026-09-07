@@ -389,6 +389,37 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         # secrets go to .env via env_var; nothing to persist natively
         pass
 
+    def post_setup(self, hermes_home: str, config: dict) -> None:
+        """Non-interactive post-setup: activate memlite and persist an explicit
+        ``plugins.memlite`` block with schema defaults, so ``hermes memory setup
+        memlite`` leaves config.yaml self-consistent. Secrets are handled by the
+        schema's ``env_var`` (DEEPINFRA_API_KEY) via the generic setup path, so
+        nothing secret is written here.
+
+        Mirrors the in-tree providers' contract (memory_setup.py: ``_post_setup_hook``
+        normalizes the ``memory`` block; a provider with ``post_setup`` owns config
+        persistence). memlite is fully self-configuring — every option has a usable
+        default — so this is a normalization, not an interactive wizard.
+        """
+        config.setdefault("memory", {})["provider"] = self.name
+        mem_cfg = config.setdefault("plugins", {}).setdefault(self.name, {})
+        defaults = {
+            "embedding_base_url": "https://api.deepinfra.com/v1/openai",
+            "embedding_model": "BAAI/bge-base-en-v1.5",
+            "llm_base_url": "https://api.deepinfra.com/v1/openai",
+            "llm_model": "deepseek-ai/DeepSeek-V3",
+            "db_path": "",
+            "user_scope": "",
+            "top_k": 5,
+        }
+        for k, v in defaults.items():
+            mem_cfg.setdefault(k, v)
+        try:
+            from hermes_cli.config import save_config
+            save_config(config)
+        except Exception:
+            logger.exception("MemLite post_setup could not persist config")
+
     def backup_paths(self) -> List[str]:
         db_path = self._config.get("db_path")
         return [str(db_path)] if db_path else []  # default db lives inside hermes_home

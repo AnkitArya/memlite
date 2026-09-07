@@ -7,4 +7,4 @@ simpler backend: one SQLite DB + the `sqlite-vec` extension for semantic search
 from .core import Memory
 
 __all__ = ["Memory"]
-__version__ = "1.0.0"
+__version__ = "1.0.1"
