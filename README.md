@@ -107,12 +107,18 @@ write time — search stays LLM-free. An illustrative miss this closed: store
 
 ### Hermes Agent plugin
 
-MemLite ships as a first-class Hermes memory provider
-(`~/.hermes/plugins/memory/memlite/`): three lifecycle hooks per turn
-(prefetch / sync-turn / queue-prefetch) plus agent tools
-`memlite_search`, `memlite_add`, `memlite_forget`. Store lives at
-`$HERMES_HOME/memlite.db`, profile-scoped. See the plugin README for
-setup (`hermes config set memory.provider memlite`).
+MemLite ships as a first-class Hermes **memory provider** — a standalone repo
+implementing the `MemoryProvider` ABC and deployed **flat** at
+`$HERMES_HOME/plugins/memlite/` (per Hermes `plugins/AGENTS.md`, this is the
+canonical path for third-party providers; `plugins/memory/` is closed to new
+in-tree backends). It integrates via `memory.provider: memlite` and drives
+three lifecycle hooks per turn (prefetch / sync-turn / queue-prefetch) plus
+agent tools `memlite_search`, `memlite_add`, `memlite_forget`. Store lives at
+`$HERMES_HOME/memlite.db`, profile-scoped.
+
+**Full install + integration guide (engine install via `uv` into the shared
+venv, flat plugin deployment, `hermes memory setup memlite` / `post_setup`,
+credentials, restart & verification):** [`hermes-plugin/README.md`](hermes-plugin/README.md).
 
 The LLM's only role is **extraction** (pass 1). The ADD/UPDATE/DELETE decision
 (pass 2) is always the deterministic arithmetic rule — no LLM call, no prompt
