@@ -68,6 +68,9 @@ _DISTANCE = "cosine"  # vec0 supports cosine
 
 # Cap on the vec0 kNN scan widening: beyond this the brute-force scan cost
 # dominates; instead of rescanning the whole table, accept fewer results.
+# kiss-cut: filtered scans silently return fewer than top_k once a scope's
+# table exceeds this many rows; ceiling ~50k rows/scope. Upgrade: partition
+# memory_vectors per scope when stores approach the cap.
 _MAX_KNN_SCAN = 50000
 # sqlite-vec hard limit: "k value in knn query too large" above 4096.
 _VEC0_K_MAX = 4096
@@ -77,6 +80,10 @@ class Store:
     def __init__(self, db_path: str = "memlite.db", dims: int = 768):
         self.db_path = db_path
         self.dims = dims
+        # kiss-cut: one global write lock serializes all mutations; SQLite is
+        # single-writer anyway so this is free today, but it also serializes
+        # the (read-side) _init_schema path. Ceiling ~1k writes/sec. Upgrade:
+        # per-connection/per-user locks only if real contention ever shows.
         self._lock = threading.Lock()
         self.conn = self._connect()
         self.conn.row_factory = sqlite3.Row

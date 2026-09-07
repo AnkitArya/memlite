@@ -236,7 +236,7 @@ class Memory:
             if not _is_retraction(t):
                 normal.append(t)
                 continue
-            sents = [s for s in re.split(r'(?<=[.!?])\s+', t.strip()) if s.strip()] if re.search(r'[.!?]', t) != None else [t]
+            sents = [s for s in re.split(r'(?<=[.!?])\s+', t.strip()) if s.strip()]
             if len(sents) <= 1:
                 reclaimed.append(t)
                 continue
@@ -251,17 +251,8 @@ class Memory:
             # the fact rather than silently dropping the add
             extracted = [{"text": t, "aliases": None} for t in texts]
 
-        return self._reconcile_many(
-            extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
-            metadata=metadata, memory_type=memory_type,
-        )
-
-    def _reconcile_many(self, texts, *, user_id, agent_id, run_id, metadata,
-                        memory_type):
-        """Reconcile is ALWAYS deterministic (no LLM): extraction may use the
-        LLM, the ADD/UPDATE/DELETE decision does not."""
         return self._deterministic_reconcile(
-            texts, user_id=user_id, agent_id=agent_id, run_id=run_id,
+            extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
             metadata=metadata, memory_type=memory_type,
         )
 
@@ -308,6 +299,9 @@ class Memory:
 
     def _deterministic_reconcile(self, facts, *, user_id, agent_id, run_id, metadata, memory_type):
         """No-LLM reconcile. Arithmetic decision over semantic + token overlap.
+
+        Reconcile is ALWAYS deterministic (no LLM): extraction MAY use the LLM,
+        the ADD/UPDATE/DELETE decision never does.
 
         *facts* is a list of {"text": str, "aliases": list[str] | None}.
 
@@ -408,7 +402,7 @@ class Memory:
         """
         if not (text and text.strip()):
             return {"results": []}
-        return self._reconcile_many(
+        return self._deterministic_reconcile(
             [{"text": text.strip(), "aliases": aliases}],
             user_id=user_id, agent_id=agent_id, run_id=run_id,
             metadata=metadata, memory_type=memory_type,

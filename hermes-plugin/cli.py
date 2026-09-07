@@ -33,16 +33,6 @@ def register_cli(p) -> None:
     p_forget.add_argument("memory_id")
 
 
-def _provider():
-    """Instantiate the provider outside the agent loop (CLI context)."""
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from . import MemLiteProvider, _load_plugin_config  # noqa: E402
-
-    return MemLiteProvider(config=_load_plugin_config())
-
-
 def memlite_command(args) -> None:
     """Route memlite subcommands (host handler convention: <name>_command)."""
     raise SystemExit(handle(args))
