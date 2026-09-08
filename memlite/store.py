@@ -92,29 +92,7 @@ class Store:
             cur.executescript(_SCHEMA_MEMORIES)
             cur.executescript(_SCHEMA_VEC.format(dims=self.dims, distance=_DISTANCE))
             cur.executescript(_SCHEMA_FTS)
-            self._migrate_schema(cur)
             self.conn.commit()
-
-    @staticmethod
-    def _migrate_schema(cur):
-        """Remove schema objects that were deliberately cut from MemLite.
-
-        SQLite's CREATE TABLE IF NOT EXISTS preserves columns from older
-        databases, so opening an existing store needs an explicit migration.
-        DROP COLUMN keeps all memory rows and their integer rowids intact; the
-        vector and FTS indexes therefore remain aligned without a rebuild.
-        """
-        columns = {row[1] for row in cur.execute("PRAGMA table_info(memories)")}
-        if "memory_type" in columns:
-            # Older releases included memory_type in this index. SQLite refuses
-            # to drop a column while an index still references it.
-            cur.execute("DROP INDEX IF EXISTS idx_memories_scope")
-            cur.execute("ALTER TABLE memories DROP COLUMN memory_type")
-            cur.execute(
-                """CREATE INDEX IF NOT EXISTS idx_memories_scope
-                   ON memories(user_id, agent_id, run_id)"""
-            )
-        cur.execute("DROP TABLE IF EXISTS history")
 
     # ---------- transaction control ----------
     def begin(self):
