@@ -120,7 +120,7 @@ def test_add_requires_llm():
     m.close()
 
 
-def test_memory_type_and_reflect():
+def test_plain_facts_coexist_and_recall():
     import tempfile
 
     db = tempfile.mktemp(suffix=".db")
@@ -133,30 +133,15 @@ def test_memory_type_and_reflect():
         db_path=db,
     )
     # seed facts as already-extracted durable statements through the standard path
-    m.add("The sky is blue on clear days", user_id="sam", memory_type="world_fact")
-    m.add("User visited the Taj Mahal last Tuesday", user_id="sam", memory_type="experience")
+    m.add("The sky is blue on clear days", user_id="sam")
+    m.add("User visited the Taj Mahal last Tuesday", user_id="sam")
 
-    # memory_type filtering
-    gg = m.get_all(filters={"user_id": "sam", "memory_type": "experience"})
-    kinds = {x["memory_type"] for x in gg["results"]}
-    assert kinds == {"experience"}, kinds
-    assert all("Taj" in x["memory"] for x in gg["results"])
+    gg = m.get_all(filters={"user_id": "sam"})
+    assert len(gg["results"]) == 2, gg
 
-    # memory_type surfaces in search results
-    sem = m.search("what type is the memory about the taj", filters={"user_id": "sam"})
-    print("\nSearch results carry memory_type:")
-    for r in sem:
-        print(f"  [{r['memory_type']}] {r['memory']}")
-    assert all("memory_type" in r for r in sem)
-
-    # reflect synthesizes (needs the LLM configured; DeepInfra chat works live)
-    ref = m.reflect("where did the user travel recently?", filters={"user_id": "sam"})
-    print("reflect synthesized:", ref["synthesized"])
-    if ref["synthesized"]:
-        print("  answer:", ref["answer"])
-        assert ref["answer"], "reflect returned empty answer"
-    else:
-        print("  (LLM unavailable; reflect returned raw memories — acceptable)")
+    sem = m.search("what did the user do on their trip", filters={"user_id": "sam"})
+    assert any("Taj" in r["memory"] for r in sem), [r["memory"] for r in sem]
+    assert all("memory_type" not in r for r in sem)
     m.close()
 
 
@@ -206,6 +191,6 @@ if __name__ == "__main__":
     test_keyword_fallback()
     test_hybrid_and_roundtrip()
     test_add_requires_llm()
-    test_memory_type_and_reflect()
+    test_plain_facts_coexist_and_recall()
     test_reconcile_update_delete()
     print("\nALL TESTS PASSED")

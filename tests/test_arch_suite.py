@@ -4,7 +4,7 @@ Run: .venv/bin/python tests/test_arch_suite.py  (live: DeepInfra embed+LLM)
 
 Cases from the review spec:
  1. Cross-vocabulary bridging (write aliases + FTS5 expansion)
- 2. Deterministic retraction (regex + cos>=0.72 -> DELETE + history snapshot)
+ 2. Deterministic retraction (regex + cos>=0.72 -> DELETE)
  3. Topic-change in-place mutation (cos>=0.65 + shared bigram -> UPDATE)
  4. False-positive safety (same entity, different fact -> ADD not UPDATE)
  5. Hybrid RRF + recency decay (today's fact outranks 45-day-old one)
@@ -64,11 +64,6 @@ def rows():
     return [dict(r) for r in c.execute("SELECT mem_id, user_id, memory, aliases FROM memories ORDER BY created_at")]
 
 
-def hist():
-    c = sqlite3.connect(db); c.row_factory = sqlite3.Row
-    return [dict(r) for r in c.execute("SELECT event, old_memory, new_memory FROM history ORDER BY created_at DESC")]
-
-
 U = "arch"
 
 # ==================================================================
@@ -104,9 +99,8 @@ check("T2a retraction emitted DELETE", "DELETE" in events2, str(events2))
 c = sqlite3.connect(db); c.row_factory = sqlite3.Row
 gone = c.execute("SELECT COUNT(*) c FROM memories WHERE memory LIKE '%pour-over%'").fetchone()["c"]
 check("T2b target row purged from memories/vec/fts", gone == 0, f"rows left={gone}")
-h2 = c.execute("SELECT event, old_memory FROM history WHERE event='DELETE' ORDER BY created_at DESC LIMIT 1").fetchone()
-check("T2c history has DELETE with old_memory snapshot",
-      bool(h2 and h2["old_memory"]), str(dict(h2) if h2 else None))
+gone_fts = c.execute("SELECT COUNT(*) c FROM memories_fts WHERE memories_fts MATCH '\"pour-over\"'").fetchone()["c"]
+check("T2c retracted fact absent from FTS index", gone_fts == 0, f"fts rows={gone_fts}")
 
 # ==================================================================
 print("\n=== TEST 3: Topic-change in-place UPDATE ===")
@@ -119,9 +113,9 @@ check("T3a emitted UPDATE", bool(ev3), str(t3b["results"]))
 if ev3:
     n_rows = c.execute("SELECT COUNT(*) c FROM memories WHERE mem_id=?", (seed3["id"],)).fetchone()["c"]
     check("T3b same id preserved (1 row, in-place)", n_rows == 1, f"id={seed3['id']} rows={n_rows}")
-    h3 = c.execute("SELECT event, old_memory, new_memory FROM history WHERE event='UPDATE' ORDER BY created_at DESC LIMIT 1").fetchone()
-    check("T3c history logs UPDATE", bool(h3 and h3["new_memory"]),
-          str(dict(h3) if h3 else "none"))
+    fts3 = c.execute("SELECT memory FROM memories_fts WHERE id=?", (seed3["id"],)).fetchone()
+    check("T3c FTS row refreshed with new text",
+          bool(fts3 and "VS Code" in (fts3["memory"] or "")), str(dict(fts3) if fts3 else None))
     after = [x for x in m.get_all(filters={"user_id": U})["results"] if "VS Code" in (x["memory"] or "")]
     check("T3c stored text refreshed to VS Code", bool(after), str([x["memory"] for x in after]))
 

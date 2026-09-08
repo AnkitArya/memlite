@@ -8,4 +8,3 @@ hooks:
   - sync_turn
   - queue_prefetch
   - on_session_end
-  - on_pre_compress

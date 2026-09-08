@@ -1,7 +1,7 @@
 """MemLite memory provider for Hermes Agent.
 
 Implements the MemoryProvider ABC backed by the memlite engine: a single
-SQLite file (memories + sqlite-vec vec0 + FTS5 + history) with an LLM
+SQLite file (memories + sqlite-vec vec0 + FTS5) with an LLM
 fact-extraction pass on add(), deterministic ADD/UPDATE/DELETE reconcile,
 and hybrid (RRF + recency) recall.
 
@@ -24,9 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import threading
-import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -38,10 +36,20 @@ except ImportError:  # tests outside the hermes-agent cwd
     MemoryProvider = object
     RecallStatus = None
 
-logger = logging.getLogger(__name__)
+try:
+    from .config_schema import DEFAULTS
+except ImportError:  # loaded as a flat package shell without config_schema
+    DEFAULTS = {
+        "embedding_base_url": "https://api.deepinfra.com/v1/openai",
+        "embedding_model": "BAAI/bge-base-en-v1.5",
+        "llm_base_url": "https://api.deepinfra.com/v1/openai",
+        "llm_model": "deepseek-ai/DeepSeek-V3",
+        "db_path": "",
+        "user_scope": "",
+        "top_k": 5,
+    }
 
-_CIRCUIT_THRESHOLD = 5
-_CIRCUIT_OPEN_SECONDS = 120.0
+logger = logging.getLogger(__name__)
 
 _SEARCH_SCHEMA = {
     "name": "memlite_search",
@@ -98,9 +106,7 @@ _FORGET_SCHEMA = {
 
 def _expand(value: str) -> str:
     """Expand ${VAR} templates in config values (env-based secrets)."""
-    if not value or "${" not in value:
-        return value
-    return re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), value)
+    return os.path.expandvars(value) if value else value
 
 
 def _load_plugin_config() -> dict:
@@ -123,15 +129,15 @@ def _build_memory(config: dict, db_path: str):
     llm_key = _expand(config.get("llm_api_key")) or emb_key
 
     emb_cfg = {
-        "model": config.get("embedding_model") or "BAAI/bge-base-en-v1.5",
+        "model": config.get("embedding_model") or DEFAULTS["embedding_model"],
         "openai_base_url": (config.get("embedding_base_url")
-                            or "https://api.deepinfra.com/v1/openai"),
+                            or DEFAULTS["embedding_base_url"]),
         "api_key": emb_key,
     }
     llm_cfg = {
-        "model": config.get("llm_model") or "deepseek-ai/DeepSeek-V3",
+        "model": config.get("llm_model") or DEFAULTS["llm_model"],
         "openai_base_url": (config.get("llm_base_url")
-                            or "https://api.deepinfra.com/v1/openai"),
+                            or DEFAULTS["llm_base_url"]),
         "api_key": llm_key,
     }
     return Memory(
@@ -149,13 +155,10 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         self._session_id = ""
         self._agent_context = "primary"
         self._hermes_home = None
-        self._sync_thread: Optional[threading.Thread] = None
         self._prefetch_cache: List[Dict[str, Any]] = []
         self._last_prefetch_count: Optional[int] = None
         self._lock = threading.Lock()
         self._closed = False
-        self._consecutive_failures = 0
-        self._circuit_open_until = 0.0
 
     # -- ABC surface -----------------------------------------------------------
 
@@ -236,7 +239,7 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Background hybrid search to pre-warm the NEXT turn."""
-        if self._closed or self._is_circuit_open() or self._mem is None:
+        if self._closed or self._mem is None:
             return
 
         def _worker():
@@ -250,22 +253,17 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 with self._lock:
                     self._prefetch_cache = hits
                     self._last_prefetch_count = len(hits)
-                self._record_success()
             except Exception as e:
                 logger.error("MemLite prefetch failed: %s", e)
                 logger.debug("%s", traceback.format_exc())
-                self._record_failure()
 
-        self._spawn(_worker)
+        threading.Thread(target=_worker, name="memlite-worker", daemon=True).start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None):
         """Non-blocking background turn sync (host threading contract)."""
         if self._closed or self._agent_context != "primary":
             return  # cron/subagent prompts must not corrupt user memory
-        if self._is_circuit_open():
-            logger.warning("MemLite circuit open; skipping background sync.")
-            return
 
         def _worker():
             try:
@@ -293,17 +291,11 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 with self._lock:
                     self._prefetch_cache = hits
                     self._last_prefetch_count = len(hits)
-                self._record_success()
             except Exception as e:
                 logger.error("MemLite background sync failed: %s", e)
                 logger.debug("%s", traceback.format_exc())
-                self._record_failure()
 
-        prev = self._sync_thread
-        if prev and prev.is_alive():
-            prev.join(timeout=5.0)
-        self._sync_thread = threading.Thread(target=_worker, name="memlite-sync", daemon=True)
-        self._sync_thread.start()
+        threading.Thread(target=_worker, name="memlite-sync", daemon=True).start()
 
     # -- tools -----------------------------------------------------------------
 
@@ -366,8 +358,6 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     def shutdown(self) -> None:
         self._closed = True
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=10.0)
         if self._mem:
             try:
                 self._mem.close()
@@ -403,16 +393,7 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         """
         config.setdefault("memory", {})["provider"] = self.name
         mem_cfg = config.setdefault("plugins", {}).setdefault(self.name, {})
-        defaults = {
-            "embedding_base_url": "https://api.deepinfra.com/v1/openai",
-            "embedding_model": "BAAI/bge-base-en-v1.5",
-            "llm_base_url": "https://api.deepinfra.com/v1/openai",
-            "llm_model": "deepseek-ai/DeepSeek-V3",
-            "db_path": "",
-            "user_scope": "",
-            "top_k": 5,
-        }
-        for k, v in defaults.items():
+        for k, v in DEFAULTS.items():
             mem_cfg.setdefault(k, v)
         try:
             from hermes_cli.config import save_config
@@ -428,28 +409,6 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     def _user_scope(self) -> str:
         return self._config.get("user_scope") or self._session_id or "default"
-
-    def _is_circuit_open(self) -> bool:
-        return time.time() < self._circuit_open_until
-
-    def _record_failure(self) -> None:
-        with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= _CIRCUIT_THRESHOLD:
-                self._circuit_open_until = time.time() + _CIRCUIT_OPEN_SECONDS
-                logger.error("MemLite circuit breaker open after %d failures; backing off %ss",
-                             _CIRCUIT_THRESHOLD, _CIRCUIT_OPEN_SECONDS)
-                self._consecutive_failures = 0
-
-    def _record_success(self) -> None:
-        with self._lock:
-            self._consecutive_failures = 0
-            self._circuit_open_until = 0.0
-
-    def _spawn(self, fn) -> threading.Thread:
-        t = threading.Thread(target=fn, name="memlite-worker", daemon=True)
-        t.start()
-        return t
 
 
 def register(ctx) -> None:

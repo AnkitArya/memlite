@@ -20,7 +20,7 @@ lexical fallback + T1–T5 suite) → `502ea28` (T6–T10 suite, core fixes).
 | Test | Feature under test | Checks | Verdict |
 |---|---|---|---|
 | T1 | Cross-vocabulary bridging (write-time aliases + FTS5) | 3 | ✅ 3/3 |
-| T2 | Deterministic retraction (regex + gate + history snapshot) | 3 | ✅ 3/3 |
+| T2 | Deterministic retraction (regex + gate, FTS purge verified) | 3 | ✅ 3/3 |
 | T3 | Topic-change in-place mutation | 4 | ✅ 4/4 |
 | T4 | False-positive safety (same entity, different fact) | 2 | ✅ 2/2 |
 | T5 | Hybrid RRF + recency decay | 2 | ✅ 2/2 |
@@ -47,13 +47,14 @@ polite phrasings — *"Please forget that I drink coffee…"* cosine vs the
 stored, extractor-rephrased fact measured **0.594**, below the bar — and the
 missed retraction was **stored as a fact**, polluting the store. Fix in
 `_decide`: retraction intent now confirms on **either** cosine ≥ 0.72 or
-shared content-bigrams (lexical-confirmation fallback), then DELETEs with
-the `old_memory` snapshot. Lt. distance measured across phrasings: 0.61–0.83.
+shared content-bigrams (lexical-confirmation fallback), then DELETEs with the
+row purged from memories, vec0, and FTS (verified in all three). Lt. distance
+measured across phrasings: 0.61–0.83.
 
 ### T3 — topic-change in-place mutation
 *"switched from Neovim to VS Code"* → `UPDATE`, same row id preserved,
-`content`/`embedding` refreshed in place, `history` UPDATE logged. No row
-fragmentation. Validated Cosine 0.728 + shared bigram `python development`.
+`content`/`embedding` refreshed in place, FTS row re-indexed with the new
+text. No row fragmentation. Validated Cosine 0.728 + shared bigram `python development`.
 
 ### T4 — same-entity-different-fact safety
 *"daily driver is a white Tata Safari"* then *"roof rack for my Tata
@@ -79,14 +80,16 @@ or the noise corpus leaks.
   query today only matches the exact scope. Real feature, not implemented;
   see "Known unsupported" below.
 
-### T7 — static alias enrichment for tool-added facts
-`add_raw("User drives an electric vehicle daily.")` — no LLM call. The
-static synonym dictionary matches "electric vehicle" → `["ev", "battery
-car", "battery"]`, merges into `aliases`, and re-indexes FTS in-place
-(update preserves row id). Query *"Does the user have an EV or battery
-car?"* hits rank #1 via keyword only, no dense leg used. Confirms that
-facts added programmatically (Hermes `memlite_add` tool) still bridge
-vocabulary a later search may use.
+### T7 — write-time aliases for tool-added facts
+`add_raw("User drives an electric vehicle daily.", aliases=[...])` — no LLM
+call. The caller-supplied aliases are stored on the row, folded into the
+embedding centroid, and indexed into the FTS corpus (update preserves row
+id). Query *"Does the user have an EV or battery car?"* hits rank #1 via
+keyword, no dense leg used. Confirms that facts added programmatically
+(Hermes `memlite_add` tool, which accepts `aliases`) still bridge vocabulary
+a later search may use. (An earlier static synonym-map fallback for
+un-aliased facts was removed — the alias path covers it; the "unrelated
+query stays clean" check in `test_alias_recall.py` guards the OR-leg.)
 
 ### T8 — paraphrase duplicate gate (spec caveat — 1/3)
 The spec asserts `cos ≥ 0.90` for the pair *"designing computer software
@@ -105,8 +108,7 @@ fully-loaded synonym graph.
 Three intents in ONE user turn → `DELETE + UPDATE + ADD`; single
 `BEGIN IMMEDIATE … COMMIT`; fact-A row deleted; fact-B row id preserved,
 content refreshed to Go; keyboard fact inserted as a distinct new row;
-`history` rows against the batch with the same commit timestamp, zero
-partial writes. **Live-exposed a genuine product bug that ran the reviewer's
+zero partial writes. **Live-exposed a genuine product bug that ran the reviewer's
 spec**: the oldr retraction reclamation marked the *whole turn* as retraction
 (`_is_retraction` matched the joined text), which suppressed extraction of
 the new facts. Fixed with **sentence-level split** inside the reclamation
@@ -129,8 +131,8 @@ mid-run degrades to raw-chunk ingestion.
 | Empty extraction + no retractions | raw texts become the facts |
 | Extractor rephrases retractions | retraction regex bypasses the extractor (T2) |
 | Any mutation fails mid-loop | whole transaction rolls back — no partials |
-| db locked | busy_timeout 5000 ms, retry ×6 |
-| Dead endpoint, background sync | circuit breaker: 5 fails → 2 min backoff |
+| db locked | busy_timeout 5000 ms, then proceeds after COMMIT |
+| Dead endpoint, background sync | logged; turns never block on memory |
 | Multi-intent turn ("forget X… start Y") | sentence-level split keeps both intents (T9) |
 
 ## Known unsupported (documented non-goals)

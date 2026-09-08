@@ -153,9 +153,9 @@ hermes memlite status         # provider CLI (if cli.py wired)
   LLM into durable facts, then deterministically reconciled (ADD / UPDATE /
   DELETE) against the store in one SQLite transaction — all non-blocking
 - **tools** — `memlite_search`, `memlite_add`, `memlite_forget`
-- **circuit breaker** — after 5 consecutive background failures it backs off
-  2 min so conversations never block on memory; `sync_turn` runs only in the
-  `primary` agent context (cron/subagent turns never write user memory)
+- **never blocks** — background failures are logged, never raised into the
+  turn; `sync_turn` runs only in the `primary` agent context (cron/subagent
+  turns never write user memory)
 
 ## CLI
 
@@ -171,8 +171,8 @@ hermes memlite forget <memory_id>
 
 - No `DEEPINFRA_API_KEY`/`OPENAI_API_KEY` → provider unavailable with an
   actionable reason; agent still starts.
-- Dead endpoint during background sync → circuit breaker pauses for 2 min
-  after 5 consecutive failures; conversations never block on memory.
+- Dead endpoint during background sync → logged; conversations never block
+  on memory.
 - sync_turn runs only in the `primary` agent context.
 - `404 invalid_api_key` on embeddings → you passed a non-DeepInfra key to the
   DeepInfra endpoint; memlite reads `OPENAI_API_KEY` before

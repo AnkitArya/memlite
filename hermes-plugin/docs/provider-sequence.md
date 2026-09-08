@@ -7,7 +7,7 @@ sequenceDiagram
     participant HV as Hermes MemLiteProvider
     participant L as Extraction LLM
     participant E as Embedder (batched)
-    participant S as Store (memlite.db: vec0 + FTS5 + history)
+    participant S as Store (memlite.db: vec0 + FTS5)
 
     note over C,HV: agent startup
     C->>HV: initialize(session_id, hermes_home=...)
@@ -22,11 +22,7 @@ sequenceDiagram
     HV->>S: plan-then-mutate: kNN reads, BEGIN IMMEDIATE, batch writes, COMMIT
     HV->>S: queue_prefetch: hybrid search for next turn (speculative)
 
-    alt background failure
-        HV->>HV: circuit breaker trip (5 fails -> 2 min backoff)
-    end
-
-    HV->>HV: shutdown(): join worker, close store
+    HV->>HV: shutdown(): close store
 ```
 
 ### Activation

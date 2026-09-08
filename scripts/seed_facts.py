@@ -18,7 +18,6 @@ Usage:
 """
 import argparse
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -27,57 +26,12 @@ sys.path.insert(0, str(REPO))
 
 SEP = "\n§\n"  # Hermes memory block separator in MEMORY.md / USER.md
 
-# Static synonym map (mirrors memlite's own _synonyms where useful) so the
-# seed facts get real related-terms for cross-vocabulary recall.
-SYNONYMS = {
-    "oracle": ["OCI", "cloud", "arm"],
-    "node": ["nodejs", "javascript runtime"],
-    "git": ["version control"],
-    "telegram": ["messaging"],
-    "desktop": ["gui", "electron"],
-    "gateway": ["messaging gateway"],
-}
-
-
-def _env_api_key():
-    env_path = os.path.expanduser("~/.hermes/.env")
-    deepinfra = openai_key = None
-    for line in open(env_path):
-        line = line.strip()
-        if line.startswith("DEEPINFRA_API_KEY=") and deepinfra is None:
-            deepinfra = line.partition("=")[2].strip().strip("\"'")
-        elif line.startswith("OPENAI_API_KEY=") and openai_key is None:
-            openai_key = line.partition("=")[2].strip().strip("\"'")
-    return deepinfra or openai_key  # prefer the DeepInfra key for the DI endpoint
-
 
 def _facts_from(text: str) -> list[str]:
     if not text:
         return []
     blocks = [b.strip() for b in text.split(SEP)]
     return [b for b in blocks if b and b.lower() not in ("", "none")]
-
-
-def _aliases_for(fact: str, max_n=4) -> list[str]:
-    """Heuristic alias set: lowercased content tokens (len>=3) + static
-    synonym expansions, capped and de-duplicated."""
-    toks = re.findall(r"[A-Za-z][A-Za-z\-]{2,}", fact.lower())
-    content = [t for t in toks if t not in {"the", "and", "for", "that", "with",
-                                            "this", "from", "your", "prefers"}]
-    out: list[str] = []
-    for t in content:
-        if t in SYNONYMS:
-            out.extend(SYNONYMS[t])
-        out.append(t)
-        if len(out) >= max_n:
-            break
-    # de-dup preserving order, keep unique
-    seen, uniq = set(), []
-    for a in out:
-        if a not in seen:
-            seen.add(a)
-            uniq.append(a)
-    return uniq[:max_n]
 
 
 def main():
@@ -90,12 +44,9 @@ def main():
                     help="drop all tables first (clean re-seed)")
     args = ap.parse_args()
 
-    key = _env_api_key()
-    if not key:
-        print("FATAL: no DEEPINFRA_API_KEY / OPENAI_API_KEY in ~/.hermes/.env")
+    if not (os.environ.get("DEEPINFRA_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+        print("FATAL: set DEEPINFRA_API_KEY / OPENAI_API_KEY in the environment")
         sys.exit(2)
-    os.environ["OPENAI_API_KEY"] = key
-    os.environ.setdefault("DEEPINFRA_API_KEY", key)
 
     from memlite import Memory
 
@@ -117,9 +68,7 @@ def main():
         facts = _facts_from(Path(path).read_text())
         print(f"[{label}] {len(facts)} fact block(s) from {path}")
         for i, fact in enumerate(facts, 1):
-            aliases = _aliases_for(fact)
-            res = m.add_raw(fact, user_id=args.user_id,
-                            memory_type="world_fact", aliases=aliases)
+            res = m.add_raw(fact, user_id=args.user_id)
             events = [r.get("event", "?") for r in res.get("results", [])]
             print(f"  {i:2}. [{','.join(events) or 'ADD'}] {fact[:70]}{'...' if len(fact) > 70 else ''}")
             inserted += 1

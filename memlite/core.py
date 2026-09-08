@@ -102,12 +102,6 @@ _RETRACT_RE = re.compile(
 )
 
 
-def _content_tokens(text: str) -> set[str]:
-    """Set of meaningful lowercase tokens, stopwords and punctuation removed."""
-    words = re.findall(r"[a-z0-9']+", text.lower())
-    return {w for w in words if w not in _STOPWORDS and len(w) > 1}
-
-
 def _content_token_list(text: str) -> list[str]:
     """ORDERED content tokens (set order is arbitrary — bigrams need order)."""
     words = re.findall(r"[a-z0-9']+", text.lower())
@@ -199,7 +193,6 @@ class Memory:
         agent_id=None,
         run_id=None,
         metadata=None,
-        memory_type="world_fact",
     ):
         """Create memory/memories. mirrors mem0 (incl. UPDATE/DELETE reconciliation).
 
@@ -211,7 +204,6 @@ class Memory:
           2) each extracted fact is reconciled against existing memories
              deterministically (no LLM):
               ADD (new fact) | UPDATE (reworded/changed same claim) | DELETE (retraction).
-        memory_type: 'world_fact' (default) or 'experience' (hindsight-inspired).
 
         Returns: {"results": [{"id", "memory", "event"}, ...]} with event in
           ADD | UPDATE | DELETE.
@@ -253,7 +245,7 @@ class Memory:
 
         return self._deterministic_reconcile(
             extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
-            metadata=metadata, memory_type=memory_type,
+            metadata=metadata,
         )
 
     def _extract(self, texts: list[str]) -> list[dict]:
@@ -297,7 +289,7 @@ class Memory:
         except Exception:
             return []
 
-    def _deterministic_reconcile(self, facts, *, user_id, agent_id, run_id, metadata, memory_type):
+    def _deterministic_reconcile(self, facts, *, user_id, agent_id, run_id, metadata):
         """No-LLM reconcile. Arithmetic decision over semantic + token overlap.
 
         Reconcile is ALWAYS deterministic (no LLM): extraction MAY use the LLM,
@@ -351,7 +343,7 @@ class Memory:
         ])
 
         # 2) read-only phase (NO transaction held): retrieve candidates and
-        #    decide for each fact; also collect prior texts for history rows.
+        #    decide for each fact.
         plan: list[tuple[str, list[float], list, list]] = []  # (text, emb, existing, aliases)
         for text, emb in zip(cleaned, embs):
             existing = []
@@ -371,7 +363,7 @@ class Memory:
                 if op["event"] == "ADD":
                     mid = store.insert(
                         text, emb, user_id=user_id, agent_id=agent_id, run_id=run_id,
-                        metadata=metadata, memory_type=memory_type, aliases=aliases,
+                        metadata=metadata, aliases=aliases,
                         in_txn=True,
                     )
                     results.append({"id": mid, "memory": text, "event": "ADD"})
@@ -390,7 +382,7 @@ class Memory:
         return {"results": results}
 
     def add_raw(self, text: str, *, user_id=None, agent_id=None, run_id=None,
-                metadata=None, memory_type="world_fact",
+                metadata=None,
                 aliases: list[str] | None = None) -> dict:
         """Store an ALREADY-EXTRACTED durable fact — no LLM extraction pass.
 
@@ -405,7 +397,7 @@ class Memory:
         return self._deterministic_reconcile(
             [{"text": text.strip(), "aliases": aliases}],
             user_id=user_id, agent_id=agent_id, run_id=run_id,
-            metadata=metadata, memory_type=memory_type,
+            metadata=metadata,
         )
 
     @staticmethod
@@ -461,8 +453,7 @@ class Memory:
         # UPDATE first (dense-similarity same-claim), and near-dup ADDs are
         # prevented by the 0.90 guard downstream. Leave update-gate logic
         # unchanged; Test-4's fix is in the reviewer's test expectations.
-        if cos_ >= cos_update and _shared_bigrams(text, best_text):
-            shared = _shared_bigrams(text, best_text)
+        if cos_ >= cos_update and (shared := _shared_bigrams(text, best_text)):
             return {"event": "UPDATE", "id": best["id"], "cos": cos_,
                     "shared": sorted(shared)}
 
@@ -558,36 +549,6 @@ class Memory:
         items.sort(key=lambda x: x["score"], reverse=True)
         return items[:top_k]
 
-    # ---------- reflect (hindsight-inspired synthesis) ----------
-    def reflect(self, query: str, *, filters: dict | None = None, top_k: int = 5):
-        """Synthesize an answer from the recalled memories (Hindsight's 'reflect').
-
-        Retrieves the top memories, then has the LLM compose a grounded, disposition-
-        aware answer from them. Falls back to returning the raw hits if no LLM is
-        configured or the call fails — reflect never blocks recall.
-        """
-        hits = self.search(query, filters=filters, top_k=top_k, strategy="hybrid")
-        if not hits or self._llm_client is None:
-            return {"answer": None, "memories": hits, "synthesized": False}
-
-        evidence = "\n".join(f"- {h['memory']}" for h in hits)
-        prompt = (
-            "You are an assistant answering a question from the user's stored memories.\n"
-            "Use ONLY the evidence below; if it does not answer the question, say so.\n\n"
-            f"Question: {query}\n\nRelevant memories:\n{evidence}\n\n"
-            "Answer concisely in 1-3 sentences, grounded strictly in the evidence."
-        )
-        try:
-            r = self._llm_client.chat.completions.create(
-                model=self._llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            answer = r.choices[0].message.content.strip()
-            return {"answer": answer, "memories": hits, "synthesized": True}
-        except Exception:
-            return {"answer": None, "memories": hits, "synthesized": False}
-
     @staticmethod
     def _shape(row: dict, source: str) -> dict:
         score = row.get("score")
@@ -597,7 +558,6 @@ class Memory:
         return {
             "id": row["id"],
             "memory": row["memory"],
-            "memory_type": row.get("memory_type", "world_fact"),
             "score": float(score) if score is not None else 0.0,
             "metadata": row.get("metadata") or {},
             "user_id": row.get("user_id"),
@@ -624,20 +584,6 @@ class Memory:
     def delete(self, memory_id: str) -> dict:
         ok = self._store_get().delete(memory_id)
         return {"results": [{"id": memory_id, "event": "DELETE"}] if ok else []}
-
-    def delete_all(self, *, user_id=None, agent_id=None, run_id=None) -> dict:
-        """Single-transaction batch delete (no fetch-then-loop N commits)."""
-        store = self._store_get()
-        rows = store.list_all(filters={"user_id": user_id, "agent_id": agent_id, "run_id": run_id})
-        store.begin()
-        try:
-            for r in rows:
-                store.delete(r["id"], in_txn=True)
-            store.commit()
-        except Exception:
-            store.rollback()
-            raise
-        return {"results": [{"id": r["id"], "event": "DELETE"} for r in rows]}
 
     def reset(self):
         if self._store:

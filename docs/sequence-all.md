@@ -11,7 +11,7 @@ sequenceDiagram
     participant M as Memory (core.py)
     participant L as LLM (extraction only)
     participant E as Embedder (OpenAI-compatible, batched)
-    participant S as Store (SQLite: memories + vec0 + FTS5 + history)
+    participant S as Store (SQLite: memories + vec0 + FTS5)
     participant P2 as Other Process
 
     %% ==================== HERMES LIFECYCLE (WRAPPER) ====================
@@ -25,7 +25,6 @@ sequenceDiagram
     HV->>M: add(messages) via worker thread (async, fire-and-forget)
     M-)HV: worker continues: speculative hybrid search
     Note over HV: worker fills _prefetch_cache for turn N+1
-    Note over HV: circuit breaker: 5 consecutive failures -> 2 min backoff
     end
 
     %% ==================== WRITE: add() ====================
@@ -53,7 +52,7 @@ sequenceDiagram
             S-->>M: existing candidates in scope
             M->>M: _decide(fact, emb, existing)
             alt DELETE: retraction intent AND cos >= 0.72
-                Note over M: queue op: DELETE(id) + old_memory snapshot
+                Note over M: queue op: DELETE(id)
             else UPDATE: (cos >= 0.65 AND shared content-bigram) OR cos >= 0.90
                 Note over M: queue op: UPDATE(id, text, emb)
             else ADD: everything else (conservative default)
@@ -63,7 +62,7 @@ sequenceDiagram
 
         %% Phase 2: mutation — atomic write transaction, minimal lock hold
         M->>S: BEGIN IMMEDIATE
-        M->>S: apply queued mutations (memories + vec0 + FTS5 + history)
+        M->>S: apply queued mutations (memories + vec0 + FTS5)
         M->>S: COMMIT (single fsync)
         M-->>C: {results: [{id, memory, event}]}
     end
@@ -95,46 +94,24 @@ sequenceDiagram
     end
     end
 
-    %% ==================== SYNTHESIS: reflect() ====================
-    rect rgb(255,250,235)
-    note over C,L: reflect(query), needs LLM, never blocks recall
-    C->>M: reflect(query, filters)
-    M->>E: embed(query)
-    E-->>M: query_emb
-    M->>S: hybrid search (RRF)
-    S-->>M: memories
-    alt no hits OR LLM call fails
-        M-->>C: {answer: null, memories, synthesized: false}
-    else LLM available
-        M->>L: grounded synthesis (evidence only)
-        L-->>M: answer
-        M-->>C: {answer, memories, synthesized: true}
-    end
-    end
-
     %% ==================== ADMIN UPDATE/DELETE (direct) ====================
     rect rgb(246,240,255)
-    note over C,S: update / delete / delete_all / get_all — no LLM needed
+    note over C,S: update / delete / get_all — no LLM needed
     opt update(text, memory_id)
         C->>M: update()
         M->>E: embed(text)
         E-->>M: emb
-        M->>S: update row + vector + FTS + history[UPDATE], then commit
+        M->>S: update row + vector + FTS, then commit
         M-->>C: {results: [UPDATE]}
     end
     opt delete(memory_id)
         C->>M: delete()
-        M->>S: delete from memories + vectors + FTS + history[DELETE, old_memory], then commit
+        M->>S: delete from memories + vectors + FTS, then commit
         M-->>C: {results: [DELETE]}
-    end
-    opt delete_all(scope)
-        C->>M: delete_all()
-        M->>S: BEGIN IMMEDIATE, delete each (in_txn), then COMMIT (single fsync batch)
-        M-->>C: {results: [DELETE...]}
     end
     opt get_all(filters)
         C->>M: get_all()
-        M->>S: list_all (scope + memory_type)
+        M->>S: list_all (user/agent/run scope)
         M-->>C: {results: [...]}
     end
     end
@@ -142,7 +119,7 @@ sequenceDiagram
     %% ==================== CONCURRENCY ====================
     rect rgb(255,240,240)
     note over S,P2: multi-process access
-    P2->>S: connect (busy_timeout=5000 + retry x6 + synchronous=NORMAL)
+    P2->>S: connect (busy_timeout=5000, synchronous=NORMAL)
     alt P2 writes while S holds write lock
         P2-->>S: SQLITE_BUSY -> busy_timeout wait -> proceeds after COMMIT
     else P2 reads while S writes
@@ -172,6 +149,5 @@ data — thresholds are tuned to fail toward ADD.
 | No LLM configured | `add()` raises ValueError; read/admin paths work fine |
 | Extraction returns empty + no retractions | raw texts stored as the facts |
 | Any mutation in the reconcile loop fails | whole transaction rolls back — no partial writes |
-| db locked by another process | busy_timeout=5000 wait, then connect retry ×6 |
-| reflect LLM fails | returns raw memories (`synthesized: false`), recall unaffected |
-| Background sync fails 5x | circuit breaker: 2 min backoff, turns never block |
+| db locked by another process | busy_timeout=5000 wait, then proceeds after COMMIT |
+| Background sync throws | logged; turns never block on memory |

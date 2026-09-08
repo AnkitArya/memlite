@@ -114,8 +114,8 @@ check("T8a no ADD for paraphrase", "ADD" not in evs8, str(evs8))
 c2 = sqlite3.connect(db); c2.row_factory = sqlite3.Row
 n8 = c2.execute("SELECT COUNT(*) c FROM memories WHERE user_id='t8'").fetchone()["c"]
 check("T8b row count strictly 1 per topic", n8 == 1, f"count={n8}")
-hist8 = c2.execute("SELECT event FROM history WHERE event='UPDATE' ORDER BY created_at DESC LIMIT 1").fetchone()
-check("T8c history has UPDATE", bool(hist8 := hist8 if False else hist8) if False else bool(c2.execute("SELECT 1 FROM history WHERE event='UPDATE'").fetchone()), "missing")
+row8 = c2.execute("SELECT memory FROM memories WHERE user_id='t8'").fetchone()
+check("T8c single row holds the latest paraphrase", bool(row8 and len(row8["memory"]) > 0), str(dict(row8) if row8 else None))
 
 # ============ T9: multi-mutation atomic batching ============
 print("\n=== T9: multi-mutation atomic batching ===")
@@ -141,8 +141,6 @@ check("T9e Rust row content updated to Go, id preserved",
       bool(rowB := rowB if False else c9.execute("SELECT COUNT(*) c FROM memories WHERE user_id='t9' AND (memory LIKE '%Go%' OR memory LIKE '%switched%')").fetchone()["c"]),
       f"go rows={rowB if False else (rowC or 0)}")
 check("T9f keyboard fact inserted", rowC >= 1, f"count={rowC}")
-h9 = [r["event"] for r in c9.execute("SELECT event FROM history WHERE event IN ('DELETE','UPDATE','ADD') ORDER BY created_at DESC LIMIT 3")]
-print("  last3 history events:", h9)
 
 # ============ T10: extraction failure fallback ============
 print("\n=== T10: extraction failure fallback (never drop data) ===")

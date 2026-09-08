@@ -4,8 +4,6 @@ Convention-based discovery: found next to __init__.py when the provider
 is the ACTIVE memory provider (memory.provider: memlite).
 """
 
-import json
-
 
 def register_cli(p) -> None:
     """Build the ``hermes memlite`` argparse subcommand tree.
@@ -52,42 +50,28 @@ def handle(args) -> int:
     if cmd == "list":
         r = p.mem.get_all(filters={"user_id": args.user or p._user_scope()})
         for x in r["results"]:
-            x.pop("embedding", None)
-            print(f"{x['id']}  [{x['memory_type']}]  {x['memory']}")
+            print(f"{x['id']}  {x['memory']}")
         print(f"-- {len(r['results'])} memories --")
         return 0
 
     if cmd == "search":
         hits = p.mem.search(args.query, strategy=args.strategy, top_k=args.top_k)
         for h in hits:
-            h.pop("embedding", None)
             print(f"[{h['score']:.3f}] {h['memory']}  (id={h['id'][:8]})")
         return 0
 
     if cmd == "stats":
         all_rows = p.mem.get_all()["results"]
-        types: dict = {}
-        for r_ in all_rows:
-            types[r_["memory_type"]] = types.get(r_["memory_type"], 0) + 1
         print(f"total memories: {len(all_rows)}")
-        for t, n in sorted(types.items()):
-            print(f"  {t}: {n}")
         return 0
 
     if cmd == "forget":
-        ok = p.mem.delete(_resolve_id(p, args.memory_id))
+        ok = p.mem.delete(args.memory_id.strip())
         print("deleted" if ok else "not found")
         return 0 if ok else 1
 
     print(f"unknown memlite command: {cmd}")
     return 2
-
-
-def _resolve_id(p, prefix):
-    mid = prefix.strip()
-    r = p.mem.get_all()["results"]
-    matches = [x["id"] for x in r if x["id"].startswith(prefix)]
-    return matches[0] if len(matches) == 1 else prefix
 
 
 def _ensure_initialized():
@@ -98,22 +82,8 @@ def _ensure_initialized():
 
 
 def _plugin_provider():
-    try:
-        from . import MemLiteProvider, _load_plugin_config
-        return MemLiteProvider(config=_load_plugin_config())
-    except ImportError:
-        # package shell registered without an __init__ (relative import
-        # fails) — fall back to loading the plugin dir by absolute path
-        import importlib.util
-        import sys
-        from pathlib import Path
-        self_dir = str(Path(__file__).resolve().parent)
-        spec = importlib.util.spec_from_file_location(
-            "memlite_plugin_cli_fallback", Path(self_dir) / "__init__.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.path.insert(0, self_dir)
-        spec.loader.exec_module(mod)
-        return mod.MemLiteProvider(config=mod._load_plugin_config())
+    from . import MemLiteProvider, _load_plugin_config
+    return MemLiteProvider(config=_load_plugin_config())
 
 
 def _hermes_home():

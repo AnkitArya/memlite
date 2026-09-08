@@ -12,7 +12,7 @@ constrained / headless hosts causes a whole class of failures:
 | Needs a Qdrant server or embedded store | **One SQLite file** — no process, no service |
 | Embedded Qdrant is single-client (one process locks it) | **WAL mode** — multiple processes can read safely, writes serialize via sqlite's own locking |
 | EOL embedder models (e.g. `nv-embed-v1` → 410 Gone) | Point at any OpenAI-compatible embeddings API; nothing baked in |
-| Vector store and row store are two systems (eventual-consistency headaches) | Vectors, rows, FTS index and history all live in **the same transactional DB** |
+| Vector store and row store are two systems (eventual-consistency headaches) | Vectors, rows and FTS index all live in **the same transactional DB** |
 | Heavy deps (pydantic, qdrant-client, grpc, …) | Just `sqlite-vec` + `openai` |
 
 ## How semantic search works
@@ -126,33 +126,24 @@ injection surface, no provider dependency in the reconcile path. An LLM is
 **required** for `add()` (it raises `ValueError` without one); `search`,
 `get_all`, `update`, `delete` work without it.
 
-### Hindsight-inspired additions
+### Deliberately omitted (checked against the Hermes host contract)
 
-Two light features borrowed from [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight)'s
-retain / recall / reflect model (mem0 doesn't have these):
+Two hindsight-inspired ideas were tried and cut after verifying nothing in
+the Hermes `MemoryProvider` lifecycle (`prefetch` string in, `sync_turn`
+write out) behaves differently with them:
 
-- **`memory_type`** — tag a memory as `"world_fact"` (default) or `"experience"`,
-  and filter on it in `search` / `get_all`:
-  ```python
-  m.add("The sky is blue on clear days", user_id="sam", memory_type="world_fact")
-  m.add("I visited the Taj Mahal last Tuesday", user_id="sam", memory_type="experience")
-  m.get_all(filters={"user_id": "sam", "memory_type": "experience"})
-  ```
-- **`reflect(query)`** — recall the top memories, then have the LLM compose a
-  grounded, disposition-aware answer (a synthesis pass beyond raw recall):
-  ```python
-  r = m.reflect("where did the user travel recently?", filters={"user_id": "sam"})
-  # {"answer": "The user recently traveled to the Taj Mahal last Tuesday.",
-  #  "memories": [...hits...], "synthesized": True}
-  ```
-  `reflect` never blocks recall — if no LLM is configured or the call fails it
-  returns `{"synthesized": False, "memories": hits}`.
-
-> Why not port more of hindsight? Its embedded mode uses a closed `pg0://` binary
-> engine (not sqlite-vec) and its core value (biomimetic memory types, entity
-> graphs, mental models, consolidation) is exactly the heavyweight machinery this
-> lean store deliberately omits. `memory_type` + `reflect` capture most of the
-> user-facing value at negligible complexity.
+- **`memory_type`** (`world_fact`/`experience`) — the host has no type
+  concept, our writes never set anything but the default, and no read
+  filtered on it. Hindsight itself narrows default recall *away* from these
+  raw layers (`observation`-only, denser per token). A type system only earns
+  its keep if it changes what a turn recalls (recall narrowing or tool-side
+  routing) — a passive tag doesn't.
+- **`reflect(query)`** (LLM synthesis over recalled hits) — no provider or
+  tool path called it; `search` returns the hits the synthesis would have
+  summarized.
+- **`history` audit table** — write-only (no API, CLI, or host reader). Kept
+  out until a first real wrong-DELETE incident justifies it, at which point
+  it returns *with* a reader (`memlite log` + undo), never silently.
 
 Hybrid mode fuses the two lists with **reciprocal rank fusion (RRF, K=60)** —
 rank-based and scale-free, unlike a raw bm25/cosine blend — then applies a
@@ -179,7 +170,6 @@ horoscope↔zodiac recall case and the multi-mutation atomic-batch turn).
 | `memories` | canonical rows: id, scope (user/agent/run), text, metadata, timestamps |
 | `memory_vectors` | `sqlite-vec` `vec0` cosine index (same DB, transactional) |
 | `memories_fts` | FTS5 keyword index (backup retrieval path) |
-| `history` | ADD / UPDATE / DELETE audit log |
 
 ## Scope & honesty
 

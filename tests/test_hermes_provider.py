@@ -32,7 +32,7 @@ if os.path.isdir(HERMES_AGENT):
 
 # import plugin module directly (it may fall back to plain object ABC)
 spec = importlib.util.spec_from_file_location(
-    "memlite_plugin", "/home/ubuntu/.hermes/plugins/memory/memlite/__init__.py")
+    "memlite_plugin", os.path.join(REPO, "hermes-plugin", "__init__.py"))
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
 
@@ -64,14 +64,19 @@ elapsed = time.time() - t0
 assert elapsed < 1.0, f"sync_turn blocked the thread ({elapsed:.2f}s)"
 print(f"5. sync_turn non-blocking OK ({elapsed * 1000:.0f}ms)")
 
-p._sync_thread.join(timeout=90)  # wait for the background add to finish
-hits = p.mem.search("dog breed", filters={"user_id": "testuser"}, top_k=3)
+p._mem is not None  # background worker runs detached; poll for the effect
+deadline = time.time() + 90
+hits = []
+while time.time() < deadline:
+    hits = p.mem.search("dog breed", filters={"user_id": "testuser"}, top_k=3)
+    if any("Biscuit" in h["memory"] for h in hits):
+        break
+    time.sleep(2)
 print("5b. search after sync:", [h["memory"] for h in hits])
 assert any("Biscuit" in h["memory"] for h in hits), hits
 
 # prefetch drains cache into context text
 p.queue_prefetch("dog", session_id="sess-1")
-worker_ref = p._sync_thread
 deadline = time.time() + 30
 while not p._prefetch_cache and time.time() < deadline:
     time.sleep(0.5)
