@@ -82,8 +82,22 @@ def _ensure_initialized():
 
 
 def _plugin_provider():
-    from . import MemLiteProvider, _load_plugin_config
-    return MemLiteProvider(config=_load_plugin_config())
+    try:
+        from . import MemLiteProvider, _load_plugin_config
+        return MemLiteProvider(config=_load_plugin_config())
+    except ImportError:
+        # The host loads cli.py as a standalone module
+        # (_hermes_user_memory.memlite__source_...), with no package context,
+        # so the relative import above fails. Load the sibling __init__.py
+        # by path instead. (This fallback is load-bearing — do not inline.)
+        import importlib.util
+        from pathlib import Path
+        here = Path(__file__).resolve().parent
+        spec = importlib.util.spec_from_file_location(
+            "memlite_provider", here / "__init__.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.MemLiteProvider(config=mod._load_plugin_config())
 
 
 def _hermes_home():
