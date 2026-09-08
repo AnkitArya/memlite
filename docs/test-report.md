@@ -144,4 +144,4 @@ mid-run degrades to raw-chunk ingestion.
 - **Cos ≥ 0.90 paraphrase guarantees for arbitrary phrasings** (T8) — real
   embeddings do not universally score paraphrases that high; alias-boosted
   writing is the supported way to merge those (hits 0.80 gate).
-- **Entity graph / cross-memory relations** (per mem0 full-product paths).
+- **Entity graph / cross-memory relations** (full-product paths).

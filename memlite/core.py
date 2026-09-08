@@ -1,8 +1,8 @@
-"""Memory - the public API, mirroring mem0.Memory (add/search/get_all/update/delete).
+"""Memory - the public API (add/search/get_all/update/delete).
 
 Design notes (lean on purpose):
   - Everything lives in one SQLite file via Store.
-  - `add` always runs the LLM extraction pass (mem0-style), then deterministically
+  - `add` always runs the LLM extraction pass, then deterministically
     reconciles each extracted fact (ADD / UPDATE / DELETE).
   - `search` uses semantic (sqlite-vec) by default; pass strategy="hybrid" to fuse
     vector + FTS5 keyword scores.
@@ -15,7 +15,7 @@ import uuid
 from .embedder import Embedder
 from .store import Store
 
-# Recency weighting for hybrid search (mirrors mem0's recency weighting idea):
+# Recency weighting for hybrid search:
 # score = rrf_score * (RECENCY_BASE + (1-RECENCY_BASE) * decay), where decay
 # halves every DECAY_HALF_LIFE_DAYS since last update.
 DECAY_HALF_LIFE_DAYS = 30.0
@@ -194,7 +194,7 @@ class Memory:
         run_id=None,
         metadata=None,
     ):
-        """Create memory/memories. mirrors mem0 (incl. UPDATE/DELETE reconciliation).
+        """Create memory/memories (incl. UPDATE/DELETE reconciliation).
 
         messages: str | dict | list[dict].
         Single path (always on):
@@ -251,10 +251,9 @@ class Memory:
     def _extract(self, texts: list[str]) -> list[dict]:
         """LLM extraction pass: distill a conversation into discrete memories.
 
-        Mirrors mem0's fact extraction. Returns a list of dicts:
-        {"text": ..., "aliases": [...]}. Returns [] if no LLM or the call
-        fails (callers fall back to raw dedupe-by-heuristic — never drop
-        data).
+        Returns a list of dicts: {"text": ..., "aliases": [...]}. Returns []
+        if no LLM or the call fails (callers fall back to raw
+        dedupe-by-heuristic — never drop data).
         """
         if self._llm_client is None:
             return []

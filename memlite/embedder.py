@@ -1,8 +1,8 @@
 """Embedding abstraction for MemLite.
 
-Mirrors mem0's `mem0.embeddings.openai.OpenAIEmbedding`: an OpenAI-compatible
-embeddings client. Point it at DeepInfra, NVIDIA, OpenAI, Groq, etc. by setting
-`openai_base_url` (defaults to OpenAI, key from OPENAI_API_KEY).
+An OpenAI-compatible embeddings client. Point it at DeepInfra, NVIDIA,
+OpenAI, Groq, etc. by setting `openai_base_url` (defaults to OpenAI, key
+from OPENAI_API_KEY).
 """
 import os
 

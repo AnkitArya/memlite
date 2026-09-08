@@ -6,7 +6,7 @@ ADD/UPDATE/DELETE reconciliation, hybrid RRF + recency recall.
 
 MemLite implements the Hermes `MemoryProvider` ABC (`agent/memory_provider.py`)
 and is integrated via `memory.provider: memlite` — exactly like the in-tree
-providers (mem0, honcho, hindsight, …). It ships as a **standalone repo** (per
+providers (honcho, hindsight, …). It ships as a **standalone repo** (per
 Hermes `plugins/AGENTS.md`: `plugins/memory/` is closed to new providers; new
 backends are standalone repos discovered through the same path).
 

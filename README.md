@@ -1,13 +1,14 @@
 # MemLite
 
-A lean, dependency-light reimplementation of [mem0](https://github.com/mem0ai/mem0)'s
-memory API — `add / search / get_all / update / delete` — backed by **a single
-SQLite file with real semantic (vector) search**.
+A lean, dependency-light semantic memory API — `add / search / get_all /
+update / delete` — backed by **a single SQLite file with real semantic
+(vector) search**.
 
-Built because mem0 OSS drags in a separate vector database (Qdrant), which on
-constrained / headless hosts causes a whole class of failures:
+Built because hosted vector-database backends (a Qdrant-style server or an
+embedded store) cause a whole class of failures on constrained / headless
+hosts:
 
-| Problem in mem0 OSS | How MemLite fixes it |
+| Problem with hosted vector DBs | How MemLite fixes it |
 |---|---|
 | Needs a Qdrant server or embedded store | **One SQLite file** — no process, no service |
 | Embedded Qdrant is single-client (one process locks it) | **WAL mode** — multiple processes can read safely, writes serialize via sqlite's own locking |
@@ -56,8 +57,8 @@ m.update("User loves spicy Thai food", memory_id=hits[0]["id"])
 m.delete(memory_id=hits[0]["id"])
 ```
 
-`add()` always runs mem0's two-pass pipeline (there is no `infer` flag — LLM
-extraction is the only path). **Pass 1 (extraction)**: the conversation is
+`add()` always runs the two-pass pipeline (LLM extraction is the only
+path — there is no `infer` flag). **Pass 1 (extraction)**: the conversation is
 distilled into discrete, durable facts — small talk, questions and assistant
 filler are dropped. Statements with retraction intent ("Forget X") bypass
 extraction so the DELETE signal survives. **Pass 2 (reconcile)**: each
@@ -173,14 +174,16 @@ horoscope↔zodiac recall case and the multi-mutation atomic-batch turn).
 
 ## Scope & honesty
 
-This is an independent, ground-up implementation of mem0's public API surface,
-not a fork of mem0's internals. It now covers mem0's core **reconcile** behavior
-(ADD / UPDATE / DELETE on `add`), plus semantic + keyword + hybrid recall. It
-still deliberately omits mem0's **entity graph / cross-memory relations,
-temporal reasoning, procedural-memory pathway, vision, and cross-encoder
-reranking** — those are the heavy parts. If your recall needs the full
-production-grade ranking, use mem0. If you need cheap, single-file,
-no-vector-server semantic memory with real conflict resolution, this is it.
+This is an independent, ground-up implementation of a five-method memory
+API surface (`add / search / get_all / update / delete`), not a fork of any
+upstream internals. It covers write-time **reconcile** behavior (ADD /
+UPDATE / DELETE on `add`), plus semantic + keyword + hybrid recall. It
+still deliberately omits **entity graphs / cross-memory relations,
+temporal reasoning, procedural-memory pathways, vision, and cross-encoder
+reranking** — those are the heavy parts. If your recall needs
+production-grade ranking with those features, use a full memory product. If
+you need cheap, single-file, no-vector-server semantic memory with real
+conflict resolution, this is it.
 
 ## License
 
