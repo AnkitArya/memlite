@@ -47,6 +47,9 @@ except ImportError:  # loaded as a flat package shell without config_schema
         "db_path": "",
         "user_scope": "",
         "top_k": 5,
+        # retention: "all" stores every reconciled fact; "selective" merges
+        # near-duplicate paraphrases (OpenViking-style) to curb store bloat.
+        "retention": "all",
     }
 
 logger = logging.getLogger(__name__)
@@ -172,7 +175,11 @@ def _build_memory(config: dict, db_path: str):
         "api_key": llm_key,
     }
     return Memory(
-        {"llm": {"config": llm_cfg}, "embedder": {"config": emb_cfg}},
+        {
+            "llm": {"config": llm_cfg},
+            "embedder": {"config": emb_cfg},
+            "retention": config.get("retention") or "all",
+        },
         db_path=db_path,
     )
 

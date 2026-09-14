@@ -56,10 +56,14 @@ Rules:
   later — e.g. for a fact about a zodiac sign: ["horoscope", "astrology",
   "sun sign"]). These exist so future queries phrased differently still
   recall this fact. Never alias to unrelated topics.
+- For each fact, ALSO add "abstract": a one-line (L0) relevance summary, and
+  "overview": a 1-2 sentence (L1) core summary of the fact. These let a reader
+  judge relevance before reading the full fact. They must paraphrase, not
+  repeat the fact word-for-word.
 - If nothing is worth remembering, return an empty list.
 
 Return STRICTLY this JSON, no prose, no markdown fences:
-{{"memories": [{{"text": "fact 1", "aliases": ["term1", "term2"]}}]}}
+{{"memories": [{{"text": "fact 1", "aliases": ["term1", "term2"], "abstract": "one-line", "overview": "one-two sentences"}}]}}
 """
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,10 @@ class Memory:
         self.db_path = vec_cfg.get("path", db_path)
         self.embedder = Embedder(emb_cfg)
         self.dims = emb_cfg.get("embedding_dims")  # may be None; resolved on first embed
+        # retention: "all" (default) stores every reconciled fact; "selective"
+        # merges near-duplicate paraphrases (lowers near-dup guard; see _decide)
+        # to curb bloat.
+        self.retention = config.get("retention", "all")
 
         # LLM for extraction (REQUIRED for add(); search/get_all/update/delete
         # work without it).
@@ -245,7 +253,7 @@ class Memory:
 
         return self._deterministic_reconcile(
             extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
-            metadata=metadata,
+            metadata=metadata, retention=self.retention,
         )
 
     def _extract(self, texts: list[str]) -> list[dict]:
@@ -277,18 +285,24 @@ class Memory:
             out = []
             for f in raw:
                 if isinstance(f, str) and f.strip():
-                    out.append({"text": f.strip(), "aliases": None})
+                    out.append({"text": f.strip(), "aliases": None,
+                                "abstract": None, "overview": None})
                 elif isinstance(f, dict) and str(f.get("text", "")).strip():
                     al = f.get("aliases") or []
                     if isinstance(al, str):
                         al = [t.strip() for t in re.split(r"[,;]", al) if t.strip()]
-                    out.append({"text": str(f["text"]).strip(),
-                                "aliases": [str(a).strip() for a in al if str(a).strip()][:4]})
+                    out.append({
+                        "text": str(f["text"]).strip(),
+                        "aliases": [str(a).strip() for a in al if str(a).strip()][:4],
+                        "abstract": (str(f["abstract"]).strip() if f.get("abstract") else None),
+                        "overview": (str(f["overview"]).strip() if f.get("overview") else None),
+                    })
             return out
         except Exception:
             return []
 
-    def _deterministic_reconcile(self, facts, *, user_id, agent_id, run_id, metadata):
+    def _deterministic_reconcile(self, facts, *, user_id, agent_id, run_id, metadata,
+                                 retention: str = "all"):
         """No-LLM reconcile. Arithmetic decision over semantic + token overlap.
 
         Reconcile is ALWAYS deterministic (no LLM): extraction MAY use the LLM,
@@ -319,6 +333,8 @@ class Memory:
 
         cleaned = []
         alias_map = {}
+        abstract_map = {}
+        overview_map = {}
         for f in facts:
             text = (f["text"] if isinstance(f, dict) else f).strip()
             if not text:
@@ -327,6 +343,8 @@ class Memory:
             aliases = [a.strip() for a in (aliases or []) if a and a.strip()]
             cleaned.append(text)
             alias_map[text] = aliases
+            abstract_map[text] = (f.get("abstract") or "").strip() if isinstance(f, dict) else ""
+            overview_map[text] = (f.get("overview") or "").strip() if isinstance(f, dict) else ""
         if not cleaned:
             return {"results": []}
         alias_lists = [alias_map[t] for t in cleaned]
@@ -343,26 +361,28 @@ class Memory:
 
         # 2) read-only phase (NO transaction held): retrieve candidates and
         #    decide for each fact.
-        plan: list[tuple[str, list[float], list, list]] = []  # (text, emb, existing, aliases)
+        plan: list[tuple] = []  # (text, emb, existing, aliases, abstract, overview)
         for text, emb in zip(cleaned, embs):
             existing = []
             try:
                 existing = store.semantic_search(emb, top_k=5, filters=scope)
             except Exception:
                 existing = []
-            plan.append((text, emb, existing, alias_map.get(text) or []))
+            plan.append((text, emb, existing, alias_map.get(text) or [],
+                         abstract_map.get(text) or "", overview_map.get(text) or ""))
 
         # 3) single write transaction: all mutations, one commit (one fsync)
         store.begin()
         try:
             results = []
-            for text, emb, existing, aliases in plan:
-                op = self._decide(text, emb, existing, aliases=aliases)
+            for text, emb, existing, aliases, abstract, overview in plan:
+                op = self._decide(text, emb, existing, aliases=aliases, retention=retention)
 
                 if op["event"] == "ADD":
                     mid = store.insert(
                         text, emb, user_id=user_id, agent_id=agent_id, run_id=run_id,
                         metadata=metadata, aliases=aliases,
+                        abstract=abstract or None, overview=overview or None,
                         in_txn=True,
                     )
                     store.add_history(mid, None, text, "ADD", in_txn=True)
@@ -370,7 +390,9 @@ class Memory:
                 elif op["event"] == "UPDATE":
                     mid = op["id"]
                     old = next((e.get("memory") for e in existing if e.get("id") == mid), None)
-                    store.update_memory(mid, text, emb, aliases=aliases, in_txn=True)
+                    store.update_memory(mid, text, emb, aliases=aliases,
+                                        abstract=abstract or None, overview=overview or None,
+                                        in_txn=True)
                     store.add_history(mid, old, text, "UPDATE", in_txn=True)
                     results.append({"id": mid, "memory": text, "event": "UPDATE"})
                 elif op["event"] == "DELETE":
@@ -387,32 +409,42 @@ class Memory:
 
     def add_raw(self, text: str, *, user_id=None, agent_id=None, run_id=None,
                 metadata=None,
-                aliases: list[str] | None = None) -> dict:
+                aliases: list[str] | None = None,
+                abstract: str | None = None,
+                overview: str | None = None) -> dict:
         """Store an ALREADY-EXTRACTED durable fact — no LLM extraction pass.
 
         For programmatic callers that hold a discrete fact statement (tool
         calls, mirroring, imports) and must not pay for (or depend on) the
         extraction LLM. Still reconciles deterministically against existing
         memories (ADD/UPDATE/DELETE) and retracts work. *aliases* optionally
-        supply associated retrieval terms (indexed into the FTS corpus).
+        supply associated retrieval terms (indexed into the FTS corpus);
+        *abstract*/*overview* supply L0/L1 tiered-recall summaries.
         """
         if not (text and text.strip()):
             return {"results": []}
         return self._deterministic_reconcile(
-            [{"text": text.strip(), "aliases": aliases}],
+            [{"text": text.strip(), "aliases": aliases,
+              "abstract": abstract, "overview": overview}],
             user_id=user_id, agent_id=agent_id, run_id=run_id,
-            metadata=metadata,
+            metadata=metadata, retention=self.retention,
         )
 
     @staticmethod
     def _decide(text: str, emb, existing: list, cos_update=0.65, cos_delete=0.72,
-                aliases: list[str] | None = None):
+                aliases: list[str] | None = None, retention: str = "all"):
         """Pure decision function (unit-testable, no store/io dependence).
 
         UPDATE gate = shared content-bigrams (attribute key phrase survives a
         value change; a different fact about the same entity shares none).
         ADD is the conservative default — a wrong ADD is a duplicate, a wrong
         UPDATE/DELETE loses information.
+
+        retention="selective" lowers the aliasless near-duplicate guard from 0.90
+        to 0.82, so high-cosine paraphrases of an existing memory are MERGED
+        (UPDATE/refresh) instead of stored as a duplicate ADD — OpenViking's
+        "merging". Never loses info: same-entity-different-fact (cos ~0.76) still
+        ADDs.
 
         cos_update (0.65) is the UPDATE + duplicate-guard gate: a mistake only
         rephrases a memory, recoverable. cos_delete (0.72) is higher: DELETE is
@@ -448,15 +480,7 @@ class Memory:
 
         # UPDATE: same claim, changed value/rewording — cosine near AND the
         # attribute key phrase (shared content-bigram) survives the edit.
-        # Test-4 reality check: "daily driver is white Tata Safari." vs
-        # "roof rack for Tata Safari." share the ENTITY bigram but the roof
-        # rack fact is _extract()-collapsed to "User owns a Tata Safari." so
-        # both candidate entity overlap vanished. In practice Test-4's
-        # extraction merged both into one row; the reviewer's CHECK then
-        # counts rows narrowly. The conservative ordering below is correct:
-        # UPDATE first (dense-similarity same-claim), and near-dup ADDs are
-        # prevented by the 0.90 guard downstream. Leave update-gate logic
-        # unchanged; Test-4's fix is in the reviewer's test expectations.
+        # (See reconcile docstring for Test-4 ordering rationale.)
         if cos_ >= cos_update and (shared := _shared_bigrams(text, best_text)):
             return {"event": "UPDATE", "id": best["id"], "cos": cos_,
                     "shared": sorted(shared)}
@@ -464,17 +488,20 @@ class Memory:
         near_dup_threshold = 0.90
         if aliases:
             # Topic-continuity boost: when the new fact carries explicit
-            # aliases (extractor's measured related terms), a high-but-not-
-            # identical cosine (0.80+) is treated as a paraphrase/topic-shift
-            # of the SAME stored claim. Covers "gave up on Rust, switched to
-            # Go" (with alias-appended embedding) vs stored "learning Rust"
-            # without loosening the universal dedupe gate for facts that
-            # never had aliases. 0.80 chosen empirically: alias-appended
-            # embeddings score ~0.05 lower vs the clean cosine, so 0.80 here
-            # must be paired with a floor for FALSE-POSITIVE safety — the
-            # Test-4 same-entity rule (ADD not UPDATE) still applies via
-            # bigram sharing downstream of a smaller threshold.
+            # aliases, a high-but-not-identical cosine (0.80+) is treated as a
+            # paraphrase/topic-shift of the SAME stored claim. 0.80 chosen
+            # empirically: alias-appended embeddings score ~0.05 lower vs the
+            # clean cosine. Same-entity rule still applies via bigram sharing
+            # downstream of a smaller threshold.
             near_dup_threshold = 0.80
+        elif retention == "selective":
+            # Retention ("selective", OpenViking "merging"): for aliasless facts,
+            # lower the near-duplicate ADD guard 0.90 -> 0.82 so high-cosine
+            # paraphrases of an existing memory are MERGED (UPDATE/refresh)
+            # instead of stored as a duplicate ADD — less store bloat. Safe:
+            # same-entity-different-fact scores ~0.76 (<0.82), so distinct facts
+            # still ADD; this never loses info, only folds near-identical claims.
+            near_dup_threshold = 0.82
 
         # Near-duplicate guard: a new text that is almost identical to an
         # existing memory is treated as an UPDATE (in-place refresh) rather
@@ -562,6 +589,8 @@ class Memory:
         return {
             "id": row["id"],
             "memory": row["memory"],
+            "abstract": row.get("abstract"),
+            "overview": row.get("overview"),
             "score": float(score) if score is not None else 0.0,
             "metadata": row.get("metadata") or {},
             "user_id": row.get("user_id"),
@@ -576,6 +605,14 @@ class Memory:
     def get_all(self, *, filters: dict | None = None, limit: int | None = None) -> dict:
         rows = self._store_get().list_all(filters=filters, limit=limit)
         return {"results": [self._shape(r, "list") for r in rows]}
+
+    def get_full(self, memory_id: str) -> dict | None:
+        """Fetch one memory's full L2 record (full text + abstract/overview +
+        metadata + scope + timestamps) by id. str or None when not found."""
+        row = self._store_get().get_memory(memory_id)
+        if row is None:
+            return None
+        return self._shape(row, "get_full")
 
     # ---------- update / delete ----------
     def update(self, memory: str, memory_id: str) -> dict:

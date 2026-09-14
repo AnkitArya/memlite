@@ -24,12 +24,23 @@ CREATE TABLE IF NOT EXISTS memories (
     metadata   TEXT,            -- JSON dict
     embed      TEXT NOT NULL,   -- JSON list of floats (kept inline for self-containment)
     aliases    TEXT,            -- JSON list of retrieval aliases (associated vocabulary)
+    abstract   TEXT,            -- L0: one-line relevance summary (tiered recall)
+    overview   TEXT,            -- L1: 1-2 sentence core summary (tiered recall)
     created_at TEXT,
     updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_scope
     ON memories(user_id, agent_id, run_id);
 """
+
+# Tiered-recall columns added after 1.0.x shipped with the base schema; on a
+# pre-existing DB the CREATE TABLE IF NOT EXISTS above is a no-op, so ALTER
+# ADD COLUMN brings old stores forward. Each ADD is wrapped in try/except
+# (COLUMNNAME already exists) in _init_schema so re-runs stay idempotent.
+_SCHEMA_MEMORIES_MIGRATE = [
+    "ALTER TABLE memories ADD COLUMN abstract TEXT",
+    "ALTER TABLE memories ADD COLUMN overview TEXT",
+]
 
 _SCHEMA_VEC = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors
@@ -111,6 +122,13 @@ class Store:
             cur.executescript(_SCHEMA_VEC.format(dims=self.dims, distance=_DISTANCE))
             cur.executescript(_SCHEMA_FTS)
             cur.executescript(_SCHEMA_HISTORY)
+            # bring pre-1.2 DBs forward: abstract/overview columns
+            for ddl in _SCHEMA_MEMORIES_MIGRATE:
+                try:
+                    cur.execute(ddl)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
             self.conn.commit()
 
     # ---------- transaction control ----------
@@ -136,13 +154,16 @@ class Store:
         metadata: dict | None = None,
         memory_id: str | None = None,
         aliases: list[str] | None = None,
+        abstract: str | None = None,
+        overview: str | None = None,
         in_txn: bool = False,
     ) -> str:
         """Insert one memory. in_txn=True skips commit — the caller owns the
         transaction (single fsync for N mutations). *aliases* are associated
         retrieval terms (synonyms/related vocabulary); they are indexed into
         the FTS corpus alongside the main text so queries using related terms
-        (e.g. "horoscope" for a stored "zodiac" fact) still recall."""
+        (e.g. "horoscope" for a stored "zodiac" fact) still recall.
+        *abstract*/overview are the L0/L1 tiered-recall summaries."""
         mid = memory_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         vec_blob = sqlite_vec.serialize_float32(embedding)
@@ -151,13 +172,13 @@ class Store:
             cur = self.conn.cursor()
             cur.execute(
                 """INSERT INTO memories
-                   (mem_id, user_id, agent_id, run_id, memory,
-                    metadata, embed, aliases, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                  (mem_id, user_id, agent_id, run_id, memory,
+                   metadata, embed, aliases, abstract, overview, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     mid, user_id, agent_id, run_id, memory,
                     json.dumps(metadata or {}), json.dumps(embedding),
-                    aliases_json, now, now,
+                    aliases_json, abstract, overview, now, now,
                 ),
             )
             row_id = cur.lastrowid
@@ -177,6 +198,8 @@ class Store:
     def update_memory(
         self, memory_id: str, memory: str, embedding: list[float],
         aliases: list[str] | None = None,
+        abstract: str | None = None,
+        overview: str | None = None,
         in_txn: bool = False,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
@@ -189,9 +212,16 @@ class Store:
             # aliases: explicit replacement, else keep existing
             merged_aliases = row["aliases"]
             aliases_json = json.dumps(aliases) if aliases else merged_aliases
+            # tiered summaries: explicit replacement, else keep existing (fall back to the new text)
+            merged_abstract = cur.execute(
+                "SELECT abstract FROM memories WHERE mem_id=?", (memory_id,)).fetchone()["abstract"]
+            merged_overview = cur.execute(
+                "SELECT overview FROM memories WHERE mem_id=?", (memory_id,)).fetchone()["overview"]
+            abstract_final = abstract if abstract is not None else (merged_abstract or memory)
+            overview_final = overview if overview is not None else (merged_overview or memory)
             cur.execute(
-                "UPDATE memories SET memory=?, embed=?, aliases=?, updated_at=? WHERE mem_id=?",
-                (memory, json.dumps(embedding), aliases_json, now, memory_id),
+                "UPDATE memories SET memory=?, embed=?, aliases=?, abstract=?, overview=?, updated_at=? WHERE mem_id=?",
+                (memory, json.dumps(embedding), aliases_json, abstract_final, overview_final, now, memory_id),
             )
             cur.execute(
                 "UPDATE memory_vectors SET embedding=? WHERE rowid=?",
@@ -277,6 +307,16 @@ class Store:
         return len(ids)
 
     # ---------- reads ----------
+    def get_memory(self, memory_id: str) -> dict | None:
+        """Fetch one memory row by mem_id (full detail, incl. L0/L1 summaries)."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT mem_id AS id, memory, abstract, overview, metadata, user_id, agent_id, run_id,"
+                " created_at, updated_at FROM memories WHERE mem_id=?",
+                (memory_id,),
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
+
     def list_all(self, filters: dict | None = None, limit: int | None = None) -> list[dict]:
         sql = """SELECT m.mem_id AS id, m.memory, m.user_id, m.agent_id,
                         m.run_id, m.metadata, m.created_at, m.updated_at
