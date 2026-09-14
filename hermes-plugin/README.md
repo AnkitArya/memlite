@@ -10,7 +10,8 @@ providers (honcho, hindsight, …). It ships as a **standalone repo** (per
 Hermes `plugins/AGENTS.md`: `plugins/memory/` is closed to new providers; new
 backends are standalone repos discovered through the same path).
 
-> **Version:** this guide targets **memlite ≥ v1.0.1** (adds `post_setup`, so
+> **Version:** this guide targets **memlite ≥ v1.2.0** (adds memory history/audit
+> via `memlite_history`, scoped purge via `memlite_purge`, plus `post_setup` so
 > `hermes memory setup memlite` works).
 
 ---
@@ -23,7 +24,7 @@ That venv ships **without `pip`** (stripped for install size), so install with
 
 ```bash
 uv pip install --python ~/.hermes/hermes-agent/venv/bin/python \
-  "memlite @ git+https://github.com/AnkitArya/memlite.git@v1.0.1"
+  "memlite @ git+https://github.com/AnkitArya/memlite.git@v1.2.0"
 ```
 
 Verify it resolves (must print the repo path — the editable/venv copy the
@@ -33,7 +34,7 @@ plugin imports):
 ~/.hermes/hermes-agent/venv/bin/python -c "import memlite; print(memlite.__version__, memlite.__file__)"
 ```
 
-> Pin the version you want (`@v1.0.1`) or omit `@…` for latest `main`. The
+> Pin the version you want (`@v1.2.0`) or omit `@…` for latest `main`. The
 > engine's `memlite/` package is what the provider imports
 > (`from memlite import Memory`).
 
@@ -75,7 +76,7 @@ done
 hermes memory setup memlite
 ```
 
-Because memlite implements `post_setup(hermes_home, config)` (v1.0.1+), this
+Because memlite implements `post_setup(hermes_home, config)` (v1.2.0+), this
 normalizes `memory.provider: memlite`, persists an explicit `plugins.memlite`
 block with defaults, and saves config. Secrets are prompted separately and
 written to `.env` (see below).
