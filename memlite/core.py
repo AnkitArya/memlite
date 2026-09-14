@@ -365,14 +365,19 @@ class Memory:
                         metadata=metadata, aliases=aliases,
                         in_txn=True,
                     )
+                    store.add_history(mid, None, text, "ADD", in_txn=True)
                     results.append({"id": mid, "memory": text, "event": "ADD"})
                 elif op["event"] == "UPDATE":
                     mid = op["id"]
+                    old = next((e.get("memory") for e in existing if e.get("id") == mid), None)
                     store.update_memory(mid, text, emb, aliases=aliases, in_txn=True)
+                    store.add_history(mid, old, text, "UPDATE", in_txn=True)
                     results.append({"id": mid, "memory": text, "event": "UPDATE"})
                 elif op["event"] == "DELETE":
                     mid = op["id"]
+                    old = next((e.get("memory") for e in existing if e.get("id") == mid), None)
                     store.delete(mid, in_txn=True)
+                    store.add_history(mid, old, None, "DELETE", in_txn=True)
                     results.append({"id": mid, "memory": None, "event": "DELETE"})
             store.commit()
         except Exception:
@@ -583,6 +588,19 @@ class Memory:
     def delete(self, memory_id: str) -> dict:
         ok = self._store_get().delete(memory_id)
         return {"results": [{"id": memory_id, "event": "DELETE"}] if ok else []}
+
+    def delete_all(self, *, user_id=None, agent_id=None, run_id=None) -> dict:
+        """Purge all memories in a scope (mem0.delete_all port). At least one of
+        user_id / agent_id / run_id is required; use reset() to wipe everything.
+        Removes the memory rows, their indexes, and their history atomically."""
+        n = self._store_get().delete_all(user_id=user_id, agent_id=agent_id, run_id=run_id)
+        return {"deleted": n}
+
+    def history(self, memory_id: str, limit: int = 50) -> list[dict]:
+        """Audit trail for a memory (mem0.history port): revisions newest-first,
+        each with event (ADD|UPDATE|DELETE), old_memory, new_memory, actor_id,
+        created_at."""
+        return self._store_get().get_history(memory_id, limit=limit)
 
     def reset(self):
         if self._store:

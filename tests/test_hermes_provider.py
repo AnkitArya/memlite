@@ -47,7 +47,9 @@ print("2. initialize OK, db:", p.mem.db_path)
 # ABC conformance
 assert p.name == "memlite"
 schemas = p.get_tool_schemas()
-assert {s["name"] for s in schemas} == {"memlite_search", "memlite_add", "memlite_forget"}
+assert {s["name"] for s in schemas} == {
+    "memlite_search", "memlite_add", "memlite_forget", "memlite_history", "memlite_purge",
+}
 print("3. tool schemas OK:", [s["name"] for s in schemas])
 
 # memlite_add tool call (no extraction pass)

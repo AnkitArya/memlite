@@ -103,6 +103,37 @@ _FORGET_SCHEMA = {
     },
 }
 
+_HISTORY_SCHEMA = {
+    "name": "memlite_history",
+    "description": "Get the audit trail for one memory by id (from memlite_search / memlite_add results). "
+                   "Returns that memory's revisions newest-first, each with event (ADD|UPDATE|DELETE), "
+                   "old_memory, new_memory, actor_id, created_at — so an overwritten or deleted value is recoverable.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Exact memory id"},
+            "limit": {"type": "integer", "description": "Max revisions to return (default 50)"},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+_PURGE_SCHEMA = {
+    "name": "memlite_purge",
+    "description": "Delete ALL memories in a scope (this user unless overridden), including the audit trail. "
+                   "At least one of user_id / agent_id / run_id is required; use with care — this is not undoable. "
+                   "Returns how many memories were deleted.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string", "description": "Scope: user (defaults to current user)"},
+            "agent_id": {"type": "string", "description": "Scope: agent"},
+            "run_id": {"type": "string", "description": "Scope: run"},
+        },
+        "required": [],
+    },
+}
+
 
 def _expand(value: str) -> str:
     """Expand ${VAR} templates in config values (env-based secrets)."""
@@ -300,7 +331,7 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     # -- tools -----------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [_SEARCH_SCHEMA, _ADD_SCHEMA, _FORGET_SCHEMA]
+        return [_SEARCH_SCHEMA, _ADD_SCHEMA, _FORGET_SCHEMA, _HISTORY_SCHEMA, _PURGE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         import json
@@ -342,6 +373,22 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 r = self._mem.delete(mid)
                 ok = bool(r and r.get("results"))
                 return json.dumps({"ok": ok})
+            if tool_name == "memlite_history":
+                mid = (args.get("memory_id") or "").strip()
+                if not mid:
+                    return json.dumps({"error": "memory_id is required (see memlite_search)"})
+                hist = self._mem.history(mid, limit=int(args.get("limit", 50)))
+                return json.dumps({"ok": True, "memory_id": mid, "history": hist})
+            if tool_name == "memlite_purge":
+                kwargs = {}
+                for k in ("user_id", "agent_id", "run_id"):
+                    v = args.get(k) or (self._user_scope() if k == "user_id" else None)
+                    if v and str(v).strip():
+                        kwargs[k] = str(v).strip()
+                if "user_id" not in kwargs and "agent_id" not in kwargs and "run_id" not in kwargs:
+                    return json.dumps({"error": "memlite_purge needs at least one of user_id/agent_id/run_id"})
+                r = self._mem.delete_all(**kwargs)
+                return json.dumps({"ok": True, "deleted": r.get("deleted", 0), "scope": kwargs})
             return json.dumps({"error": f"unknown tool {tool_name}"})
         except Exception as e:
             logger.error("MemLite tool call failed: %s", e)

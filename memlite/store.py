@@ -43,6 +43,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
 USING fts5(id UNINDEXED, memory, aliases);
 """
 
+# Append-only audit trail ported from mem0's history (memory/storage.py). Every
+# ADD / UPDATE / DELETE on a memory writes one row here, so a value that was
+# overwritten or deleted in place is always recoverable. Lives in the SAME file
+# as memories (unlike mem0's separate history.db) so it stays single-file and
+# rides the existing WAL transaction.
+_SCHEMA_HISTORY = """
+CREATE TABLE IF NOT EXISTS memories_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    mem_id     TEXT NOT NULL,
+    old_memory TEXT,
+    new_memory TEXT,
+    event      TEXT NOT NULL,        -- ADD | UPDATE | DELETE
+    actor_id   TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_history_mem_id ON memories_history(mem_id);
+"""
+
 _DISTANCE = "cosine"  # vec0 supports cosine
 
 # Cap on the vec0 kNN scan widening: beyond this the brute-force scan cost
@@ -92,6 +110,7 @@ class Store:
             cur.executescript(_SCHEMA_MEMORIES)
             cur.executescript(_SCHEMA_VEC.format(dims=self.dims, distance=_DISTANCE))
             cur.executescript(_SCHEMA_FTS)
+            cur.executescript(_SCHEMA_HISTORY)
             self.conn.commit()
 
     # ---------- transaction control ----------
@@ -201,6 +220,61 @@ class Store:
             if not in_txn:
                 self.conn.commit()
         return True
+
+    # ---------- history (audit trail) ----------
+    def add_history(self, memory_id, old_memory, new_memory, event, *, actor_id=None,
+                    created_at=None, in_txn=False) -> None:
+        """Append one audit record. in_txn=True shares the caller's transaction
+        (no extra fsync) — reconcile() writes its per-fact history rows inside the
+        single BEGIN IMMEDIATE block."""
+        if created_at is None:
+            created_at = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO memories_history (mem_id, old_memory, new_memory, event, actor_id, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (memory_id, old_memory, new_memory, event, actor_id, created_at),
+            )
+            if not in_txn:
+                self.conn.commit()
+
+    def get_history(self, memory_id: str, limit: int = 50) -> list[dict]:
+        """Revisions for a memory, newest first. old_memory is None for ADD,
+        new_memory is None for DELETE."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT event, old_memory, new_memory, actor_id, created_at"
+                " FROM memories_history WHERE mem_id=? ORDER BY id DESC LIMIT ?",
+                (memory_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_all(self, *, user_id=None, agent_id=None, run_id=None) -> int:
+        """Scoped bulk delete (mem0.delete_all port). At least one scope filter is
+        required — a bare wipe goes through reset(). Deletes the memory rows, their
+        vector index rows, FTS rows, and their history trail atomically; returns the
+        number of memories purged."""
+        scope = [(k, v) for k, v in (("user_id", user_id), ("agent_id", agent_id), ("run_id", run_id))
+                 if v is not None]
+        if not scope:
+            raise ValueError("delete_all requires at least one of user_id, agent_id, run_id; use reset() to wipe everything")
+        with self._lock:
+            cur = self.conn.cursor()
+            where = " AND ".join(f"{k}=?" for k, _ in scope)
+            args = [v for _, v in scope]
+            ids = cur.execute(f"SELECT id, mem_id FROM memories WHERE {where}", args).fetchall()
+            if not ids:
+                return 0
+            row_ids = [r["id"] for r in ids]
+            mem_ids = [r["mem_id"] for r in ids]
+            marks = ",".join("?" * len(row_ids))
+            cur.execute(f"DELETE FROM memories WHERE id IN ({marks})", row_ids)
+            cur.execute(f"DELETE FROM memory_vectors WHERE rowid IN ({marks})", row_ids)
+            cur.execute(f"DELETE FROM memories_fts WHERE id IN ({marks})", mem_ids)
+            cur.execute(f"DELETE FROM memories_history WHERE mem_id IN ({marks})", mem_ids)
+            self.conn.commit()
+        return len(ids)
 
     # ---------- reads ----------
     def list_all(self, filters: dict | None = None, limit: int | None = None) -> list[dict]:
