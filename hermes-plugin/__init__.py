@@ -27,7 +27,7 @@ import os
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from agent.memory_provider import MemoryProvider, RecallStatus
@@ -50,6 +50,9 @@ except ImportError:  # loaded as a flat package shell without config_schema
         # retention: "all" stores every reconciled fact; "selective" merges
         # near-duplicate paraphrases (OpenViking-style) to curb store bloat.
         "retention": "all",
+        # show_save_indicator: emit a "🧠 saved N to memory" status line in the
+        # chat after a background turn-sync actually persists something.
+        "show_save_indicator": False,
     }
 
 logger = logging.getLogger(__name__)
@@ -197,6 +200,12 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         self._last_prefetch_count: Optional[int] = None
         self._lock = threading.Lock()
         self._closed = False
+        # Optional in-chat save indicator (hindsight `_status_callback` pattern):
+        # the host injects a status_channel callback; when show_save_indicator is
+        # on we push a one-line "saved to memory" notification after a background
+        # turn-sync. Off by default (non-intrusive); enable via plugins.memlite.
+        self._status_callback: Optional[Callable[[str], None]] = None
+        self._show_save_indicator = bool(self._config.get("show_save_indicator", False))
 
     # -- ABC surface -----------------------------------------------------------
 
@@ -235,6 +244,11 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context") or "primary"
+        # Status channel for the save indicator (hindsight pattern): the host
+        # injects a callable the provider may push one-line status updates to.
+        if callable(kwargs.get("status_callback")):
+            self._status_callback = kwargs["status_callback"]
+        self._show_save_indicator = bool(self._config.get("show_save_indicator", False))
         home = (kwargs.get("hermes_home")
                 or getattr(self, "_hermes_home", None)
                 or os.environ.get("HERMES_HOME"))
@@ -318,7 +332,13 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                         {"role": "user", "content": user_content or ""},
                         {"role": "assistant", "content": assistant_content or ""},
                     ]
-                self._mem.add(convo, user_id=self._user_scope())  # LLM extraction + reconcile
+                res = self._mem.add(convo, user_id=self._user_scope())  # LLM extraction + reconcile
+                if self._show_save_indicator and self._status_callback is not None:
+                    # count ADD/UPDATE events to confirm an actionable save occurred
+                    evs = (res or {}).get("results", [])
+                    saved = [e for e in evs if e.get("event") in ("ADD", "UPDATE")]
+                    if saved:
+                        self._status_callback(f"🧠 memlite — saved {len(saved)} to memory")
                 # speculative prefetch for the next turn
                 hits = self._mem.search(
                     user_content or assistant_content or "",
