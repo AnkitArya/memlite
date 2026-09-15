@@ -27,7 +27,7 @@ import os
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     from agent.memory_provider import MemoryProvider, RecallStatus
@@ -50,9 +50,6 @@ except ImportError:  # loaded as a flat package shell without config_schema
         # retention: "all" stores every reconciled fact; "selective" merges
         # near-duplicate paraphrases (OpenViking-style) to curb store bloat.
         "retention": "all",
-        # show_save_indicator: emit a "🧠 saved N to memory" status line in the
-        # chat after a background turn-sync actually persists something.
-        "show_save_indicator": False,
     }
 
 logger = logging.getLogger(__name__)
@@ -79,12 +76,14 @@ _SEARCH_SCHEMA = {
 _ADD_SCHEMA = {
     "name": "memlite_add",
     "description": (
-        "Copy an already-durable fact statement into MemLite long-term memory "
-        "(no LLM extraction pass — the fact should be a clean, self-contained "
-        "statement like 'User prefers snake_case in Python'). Optionally pass "
-        "aliases: 2-4 closely-related retrieval terms (synonyms/super-categor"
-        "ies, e.g. horoscope↔zodiac) so differently-phrased future queries "
-        "still recall this fact."
+        "Store a durable fact about the user (verbatim — no LLM extraction pass). "
+        "Call this the moment the user states a lasting preference, correction, decision, "
+        "or personal detail worth recalling on future turns — don't wait to be asked to "
+        "remember. The fact should be a clean, self-contained statement like "
+        "'User prefers snake_case in Python'. Skip transient chit-chat and facts you've "
+        "already stored. Optionally pass aliases: 2-4 closely-related retrieval terms "
+        "(synonyms/super-categories, e.g. horoscope↔zodiac) so differently-phrased future "
+        "queries still recall this fact."
     ),
     "parameters": {
         "type": "object",
@@ -96,6 +95,18 @@ _ADD_SCHEMA = {
         "required": ["fact"],
     },
 }
+
+_PROMPT_BODY = (
+    "You have persistent memory of this user from past conversations. You should call "
+    "memlite_search before answering anything that could depend on prior context (the user's "
+    "preferences, facts, history, people, projects, or earlier decisions) — do not rely on the "
+    "chat window alone, and do not assume you have no memory.\n"
+    "When the user states a durable preference, correction, decision, or personal detail worth "
+    "recalling later, call memlite_add immediately to store it — don't wait to be asked, and "
+    "don't rely on background extraction to catch it.\n"
+    "Tools: memlite_search to recall facts, memlite_add to store facts, memlite_forget to "
+    "remove by id, memlite_history to audit a fact's revisions."
+)
 
 _FORGET_SCHEMA = {
     "name": "memlite_forget",
@@ -200,12 +211,6 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         self._last_prefetch_count: Optional[int] = None
         self._lock = threading.Lock()
         self._closed = False
-        # Optional in-chat save indicator (hindsight `_status_callback` pattern):
-        # the host injects a status_channel callback; when show_save_indicator is
-        # on we push a one-line "saved to memory" notification after a background
-        # turn-sync. Off by default (non-intrusive); enable via plugins.memlite.
-        self._status_callback: Optional[Callable[[str], None]] = None
-        self._show_save_indicator = bool(self._config.get("show_save_indicator", False))
 
     # -- ABC surface -----------------------------------------------------------
 
@@ -244,11 +249,6 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context") or "primary"
-        # Status channel for the save indicator (hindsight pattern): the host
-        # injects a callable the provider may push one-line status updates to.
-        if callable(kwargs.get("status_callback")):
-            self._status_callback = kwargs["status_callback"]
-        self._show_save_indicator = bool(self._config.get("show_save_indicator", False))
         home = (kwargs.get("hermes_home")
                 or getattr(self, "_hermes_home", None)
                 or os.environ.get("HERMES_HOME"))
@@ -332,13 +332,7 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                         {"role": "user", "content": user_content or ""},
                         {"role": "assistant", "content": assistant_content or ""},
                     ]
-                res = self._mem.add(convo, user_id=self._user_scope())  # LLM extraction + reconcile
-                if self._show_save_indicator and self._status_callback is not None:
-                    # count ADD/UPDATE events to confirm an actionable save occurred
-                    evs = (res or {}).get("results", [])
-                    saved = [e for e in evs if e.get("event") in ("ADD", "UPDATE")]
-                    if saved:
-                        self._status_callback(f"🧠 memlite — saved {len(saved)} to memory")
+                self._mem.add(convo, user_id=self._user_scope())  # LLM extraction + reconcile
                 # speculative prefetch for the next turn
                 hits = self._mem.search(
                     user_content or assistant_content or "",
@@ -359,6 +353,13 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [_SEARCH_SCHEMA, _ADD_SCHEMA, _FORGET_SCHEMA, _HISTORY_SCHEMA, _PURGE_SCHEMA]
+
+    def system_prompt_block(self) -> str:
+        """STATIC system-prompt text telling the agent to proactively recall and
+        store memories (mirrors mem0's _PROMPT_BODY). Without this the model never
+        calls memlite_add explicitly, so durable facts only land via the silent
+        background sync_turn and never surface as a visible tool call in chat."""
+        return f"# MemLite Memory\nActive.\n{_PROMPT_BODY}"
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         import json

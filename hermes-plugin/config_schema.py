@@ -14,12 +14,6 @@ DEFAULTS = {
     "db_path": "",
     "user_scope": "",
     "top_k": 5,
-    # retention: "all" stores every reconciled fact; "selective" merges
-    # near-duplicate paraphrases (OpenViking-style) to curb store bloat.
-    "retention": "all",
-    # show_save_indicator: emit a "🧠 saved N to memory" status line in the
-    # chat after a background turn-sync actually persists something.
-    "show_save_indicator": False,
 }
 
 SCHEMA = {
@@ -73,21 +67,6 @@ SCHEMA = {
             "default": DEFAULTS["top_k"],
             "minimum": 1,
             "maximum": 50,
-        },
-        {
-            "key": "retention",
-            "label": "Retention policy",
-            "type": "string",
-            "default": DEFAULTS["retention"],
-            "choices": ["all", "selective"],
-            "help": "selective merges near-duplicate paraphrases to curb memory bloat.",
-        },
-        {
-            "key": "show_save_indicator",
-            "label": "Show 'saved to memory' chat indicator",
-            "type": "boolean",
-            "default": DEFAULTS["show_save_indicator"],
-            "help": "Emit a 🧠 status line in chat when a turn is saved to memory.",
         },
     ],
 }
