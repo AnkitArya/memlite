@@ -58,15 +58,13 @@ print("4. memlite_add:", resp)
 payload = json.loads(resp)
 assert payload.get("ok"), payload
 
-# sync_turn: non-blocking (returns immediately), worker runs extraction
-t0 = time.time()
-p.sync_turn("Hey! Remember my dog Biscuit is a golden retriever.",
-            "Congratulations, puppies are wonderful!")
-elapsed = time.time() - t0
-assert elapsed < 1.0, f"sync_turn blocked the thread ({elapsed:.2f}s)"
-print(f"5. sync_turn non-blocking OK ({elapsed * 1000:.0f}ms)")
+# on_memory_write: the primary long-term write path (mirrors built-in `memory` tool).
+# sync_turn was removed (issue #1): background raw-transcript sync is disabled, so a
+# per-turn fact only lands when the model writes it via memlite_add or on_memory_write.
+p.on_memory_write("add", "memory", "User's dog Biscuit is a golden retriever.",
+                  {"session_id": "sess-1", "tool_name": "memory", "write_origin": "memory_tool"})
+print("5. on_memory_write (add) executed")
 
-p._mem is not None  # background worker runs detached; poll for the effect
 deadline = time.time() + 90
 hits = []
 while time.time() < deadline:
@@ -74,7 +72,7 @@ while time.time() < deadline:
     if any("Biscuit" in h["memory"] for h in hits):
         break
     time.sleep(2)
-print("5b. search after sync:", [h["memory"] for h in hits])
+print("5b. search after on_memory_write:", [h["memory"] for h in hits])
 assert any("Biscuit" in h["memory"] for h in hits), hits
 
 # prefetch drains cache into context text

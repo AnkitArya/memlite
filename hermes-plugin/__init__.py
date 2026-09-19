@@ -102,8 +102,7 @@ _PROMPT_BODY = (
     "preferences, facts, history, people, projects, or earlier decisions) — do not rely on the "
     "chat window alone, and do not assume you have no memory.\n"
     "When the user states a durable preference, correction, decision, or personal detail worth "
-    "recalling later, call memlite_add immediately to store it — don't wait to be asked, and "
-    "don't rely on background extraction to catch it.\n"
+    "recalling later, call memlite_add immediately to store it — don't wait to be asked.\n"
     "Tools: memlite_search to recall facts, memlite_add to store facts, memlite_forget to "
     "remove by id, memlite_history to audit a fact's revisions."
 )
@@ -311,43 +310,14 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
         threading.Thread(target=_worker, name="memlite-worker", daemon=True).start()
 
-    def sync_turn(self, user_content: str, assistant_content: str, *,
-                  session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None):
-        """Non-blocking background turn sync (host threading contract)."""
-        if self._closed or self._agent_context != "primary":
-            return  # cron/subagent prompts must not corrupt user memory
-
-        def _worker():
-            try:
-                if messages:
-                    # use the real conversation context Hermes hands us
-                    convo = [
-                        {"role": m.get("role", "user"),
-                         "content": m.get("content") or ""}
-                        for m in messages
-                        if m.get("role") in ("user", "assistant") and m.get("content")
-                    ]
-                else:
-                    convo = [
-                        {"role": "user", "content": user_content or ""},
-                        {"role": "assistant", "content": assistant_content or ""},
-                    ]
-                self._mem.add(convo, user_id=self._user_scope())  # LLM extraction + reconcile
-                # speculative prefetch for the next turn
-                hits = self._mem.search(
-                    user_content or assistant_content or "",
-                    filters={"user_id": self._user_scope()},
-                    top_k=int(self._config.get("top_k", 5)),
-                    strategy="hybrid",
-                )
-                with self._lock:
-                    self._prefetch_cache = hits
-                    self._last_prefetch_count = len(hits)
-            except Exception as e:
-                logger.error("MemLite background sync failed: %s", e)
-                logger.debug("%s", traceback.format_exc())
-
-        threading.Thread(target=_worker, name="memlite-sync", daemon=True).start()
+    # Note: `sync_turn` (background per-turn conversation sync) is intentionally NOT
+    # overridden. The base MemoryProvider.sync_turn is a no-op here, so Hermes'
+    # MemoryManager.sync_all() no longer feeds raw transcripts into the store for
+    # automatic extraction. Long-term memory is written ONLY via the model-driven
+    # in-turn path (memlite_add tool + on_memory_write mirroring the built-in
+    # `memory` tool). See https://github.com/AnkitArya/memlite/issues/1 — background
+    # per-turn extraction was leaking working-notes as durable facts and is deferred
+    # until the extractor model + fallback are fixed.
 
     # -- tools -----------------------------------------------------------------
 
@@ -356,9 +326,8 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     def system_prompt_block(self) -> str:
         """STATIC system-prompt text telling the agent to proactively recall and
-        store memories (mirrors mem0's _PROMPT_BODY). Without this the model never
-        calls memlite_add explicitly, so durable facts only land via the silent
-        background sync_turn and never surface as a visible tool call in chat."""
+        store memories (mirrors mem0's _PROMPT_BODY). The model drives all writes
+        explicitly via memlite_add (no background sync_turn)."""
         return f"# MemLite Memory\nActive.\n{_PROMPT_BODY}"
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -422,6 +391,70 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
             logger.error("MemLite tool call failed: %s", e)
             logger.debug("%s", traceback.format_exc())
             return json.dumps({"error": str(e)})
+
+    # -- built-in memory tool bridge ----------------------------------------------
+
+    def on_memory_write(self, action: str, target: str, content: str,
+                        metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Mirror Hermes' built-in in-turn ``memory`` tool writes into the memlite
+        store (the MemoryProvider ``on_memory_write`` hook).
+
+        Hermes calls this whenever the model commits a ``memory(action=add|replace|remove,
+        target=memory|user, ...)`` call (``MemoryManager.notify_memory_tool_write`` → here).
+        ``metadata`` carries ``old_text`` (for replace/remove), ``session_id``, ``tool_name``,
+        ``task_id``. This is the primary long-term-memory write path now that the background
+        ``sync_turn`` is disabled (issue #1).
+        """
+        if self._closed or self._mem is None:
+            return  # not initialized / shutting down — fail soft
+        if not (action or "").strip():
+            return
+        uid = self._user_scope()
+        if not isinstance(metadata, dict):
+            metadata = {}
+        meta = dict(metadata)
+        meta.setdefault("write_origin", "memory_tool")
+        meta.setdefault("target", target or "memory")
+        # target is informational for now; the store is single-user "default".
+        try:
+            action = action.strip().lower()
+            text = (content or "").strip()
+            if action == "add":
+                if text:
+                    self._mem.add_raw(text, user_id=uid, metadata=meta)
+                return
+            old_text = (meta.get("old_text") or "").strip()
+            mid = self._find_by_text(old_text, uid)
+            if action == "remove":
+                if mid:
+                    self._mem.delete(mid)
+                return
+            if action == "replace":
+                if mid and text:
+                    self._mem.update(text, mid)
+                elif text:
+                    # no exact old_text match: fall back to deterministic reconcile (may UPDATE a near-dup)
+                    self._mem.add_raw(text, user_id=uid, metadata=meta)
+                return
+            logger.warning("MemLite on_memory_write: ignoring unknown action %r", action)
+        except Exception as e:
+            logger.error("MemLite on_memory_write failed (%s): %s", action, e)
+            logger.debug("%s", traceback.format_exc())
+
+    def _find_by_text(self, text: str, user_id: str) -> Optional[str]:
+        """Return the id of a memory whose text contains *text* (used for replace/remove
+        old_text matching). Best-effort exact/substring match; None if ambiguous or absent."""
+        if not text:
+            return None
+        try:
+            all_rows = self._mem.get_all(filters={"user_id": user_id}).get("results", [])
+        except Exception:
+            return None
+        matched = [r for r in all_rows if text and text in (r.get("memory") or "")]
+        if len({r["memory"] for r in matched}) != 1:
+            # ambiguous or none (distinct entries) — don't guess
+            return None
+        return matched[0]["id"] if matched else None
 
     # -- session lifecycle ------------------------------------------------------
 
