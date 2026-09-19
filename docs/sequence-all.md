@@ -1,5 +1,13 @@
 # MemLite — Single UML Sequence Diagram (current flow)
 
+> **⚠️ ARCHIVE / PARTIALLY STALE.** The `sync_turn` lifecycle block below predates
+> issue #1. **`sync_turn` is REMOVED** — the Hermes provider no longer feeds raw
+> transcripts into `add()` on every turn. The **current** memory write path is
+> model-driven in-turn via `on_memory_write`/`memlite_add`; see
+> **[`hermes-agent-memory-sequence.md`](./hermes-agent-memory-sequence.md)** for the
+> live diagram. This file's engine internals (add/search/update/delete, thresholds,
+> reconcile) remain accurate.
+
 > One diagram, all cases. Validated renders via mermaid.ink. Thresholds
 > calibrated on live bge-base-en-v1.5 embeddings.
 
