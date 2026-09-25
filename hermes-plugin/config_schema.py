@@ -10,10 +10,15 @@ DEFAULTS = {
     "embedding_base_url": "https://api.deepinfra.com/v1/openai",
     "embedding_model": "BAAI/bge-base-en-v1.5",
     "llm_base_url": "https://api.deepinfra.com/v1/openai",
-    "llm_model": "deepseek-ai/DeepSeek-V3",
+    "llm_model": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "db_path": "",
     "user_scope": "",
     "top_k": 5,
+    # Background per-turn capture (mirrors mem0 sync_turn). Enabled by default;
+    # the truncation + durable-fact extraction guard against the working-note
+    # leak that led to it being pulled in the first place (memlite issue #1).
+    "sync_turn_enabled": True,
+    "sync_max_chars": 450,
 }
 
 SCHEMA = {
@@ -67,6 +72,25 @@ SCHEMA = {
             "default": DEFAULTS["top_k"],
             "minimum": 1,
             "maximum": 50,
+        },
+        {
+            "key": "sync_turn_enabled",
+            "label": "Background per-turn capture (sync_turn)",
+            "type": "boolean",
+            "default": DEFAULTS["sync_turn_enabled"],
+            "help": "After each turn, feed (truncated) user+assistant content to the LLM "
+                   "extractor so durable facts are stored automatically. Safeguards "
+                   "against the working-note leak that disabled it before.",
+        },
+        {
+            "key": "sync_max_chars",
+            "label": "Sync message length cap",
+            "type": "integer",
+            "default": DEFAULTS["sync_max_chars"],
+            "minimum": 64,
+            "maximum": 8192,
+            "help": "Max characters of each side of a turn fed to sync_turn extraction "
+                   "(truncated at a sentence boundary). Lower = less scratch noise.",
         },
     ],
 }

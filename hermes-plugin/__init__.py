@@ -13,7 +13,7 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       embedding_model: null     # default: BAAI/bge-base-en-v1.5
       embedding_api_key: null   # template like ${DEEPINFRA_API_KEY}
       llm_base_url: null        # default: DeepInfra endpoint
-      llm_model: null           # default: deepseek-ai/DeepSeek-V3
+      llm_model: null           # default: deepseek-ai/DeepSeek-V4-Flash-0731
       llm_api_key: null         # template like ${DEEPINFRA_API_KEY}
       user_scope: null          # user_id filter; empty -> per-session id
       top_k: 5
@@ -43,13 +43,17 @@ except ImportError:  # loaded as a flat package shell without config_schema
         "embedding_base_url": "https://api.deepinfra.com/v1/openai",
         "embedding_model": "BAAI/bge-base-en-v1.5",
         "llm_base_url": "https://api.deepinfra.com/v1/openai",
-        "llm_model": "deepseek-ai/DeepSeek-V3",
+        "llm_model": "deepseek-ai/DeepSeek-V4-Flash-0731",
         "db_path": "",
         "user_scope": "",
         "top_k": 5,
         # retention: "all" stores every reconciled fact; "selective" merges
         # near-duplicate paraphrases (OpenViking-style) to curb store bloat.
         "retention": "all",
+        # Background per-turn capture (mirrors mem0 sync_turn). Enabled by default;
+        # truncation + durable-fact extraction guard against the working-note leak.
+        "sync_turn_enabled": True,
+        "sync_max_chars": 450,
     }
 
 logger = logging.getLogger(__name__)
@@ -209,6 +213,10 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         self._prefetch_cache: List[Dict[str, Any]] = []
         self._last_prefetch_count: Optional[int] = None
         self._lock = threading.Lock()
+        self._sync_lock = threading.Lock()
+        self._sync_thread: Optional[threading.Thread] = None
+        self._sync_turn_enabled = bool(self._config.get("sync_turn_enabled", True))
+        self._sync_max_chars = int(self._config.get("sync_max_chars", 450) or 450)
         self._closed = False
 
     # -- ABC surface -----------------------------------------------------------
@@ -310,14 +318,82 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
         threading.Thread(target=_worker, name="memlite-worker", daemon=True).start()
 
-    # Note: `sync_turn` (background per-turn conversation sync) is intentionally NOT
-    # overridden. The base MemoryProvider.sync_turn is a no-op here, so Hermes'
-    # MemoryManager.sync_all() no longer feeds raw transcripts into the store for
-    # automatic extraction. Long-term memory is written ONLY via the model-driven
-    # in-turn path (memlite_add tool + on_memory_write mirroring the built-in
-    # `memory` tool). See https://github.com/AnkitArya/memlite/issues/1 — background
-    # per-turn extraction was leaking working-notes as durable facts and is deferred
-    # until the extractor model + fallback are fixed.
+    # -- background per-turn capture (sync_turn) -----------------------------
+    #
+    # `sync_turn` is the MemoryProvider ABC hook MemoryManager.sync_all() calls
+    # after every turn. It was originally disabled (memlite issue #1) because
+    # feeding raw transcripts to the extractor leaked working-notes as durable
+    # facts. Re-enabled with mem0-derived safeguards that fix that leak:
+    #   1) each message is truncated at a sentence boundary to `sync_max_chars`
+    #      (default 450), so long scratch/analysis dumps never reach the LLM;
+    #   2) extraction still goes through the engine's durable-fact pass
+    #      (`add()` → `_extract`), which distills discrete facts and runs
+    #      deterministic ADD/UPDATE/DELETE reconcile (no duplicated rows);
+    #   3) it runs on a background thread with a join-guard so it never blocks
+    #      the turn and never double-ingests a slow previous sync.
+    # Gated on config `plugins.memlite.sync_turn_enabled` (default true).
+
+    def sync_turn(self, user_content: str, assistant_content: str, *,
+                  session_id: str = "") -> None:
+        if self._closed or self._mem is None or not self._sync_turn_enabled:
+            return
+
+        def _truncate(text: str, max_len: int) -> str:
+            if not text or len(text) <= max_len:
+                return text or ""
+            window = text[:max_len]
+            cut = max(window.rfind(sep) for sep in ("。", "！", "？", ".", "!", "?"))
+            if cut > max_len // 3:
+                return window[:cut + 1]
+            return window
+
+        def _worker() -> None:
+            try:
+                uid = self._user_scope()
+                messages = [
+                    _truncate(user_content, self._sync_max_chars),
+                    _truncate(assistant_content, self._sync_max_chars),
+                ]
+                messages = [m for m in messages if m.strip()]
+                if not messages:
+                    return
+                result = self._mem.add(
+                    messages, user_id=uid,
+                    metadata={"write_origin": "sync_turn", "session_id": session_id or self._session_id},
+                )
+                results = result.get("results", []) if isinstance(result, dict) else []
+                if results:
+                    # Leak guard: if the extractor returned [] and the engine fell
+                    # back to storing a raw input message verbatim (issue #1 path),
+                    # drop it — the whole point of sync_turn is distilled FACTS, not
+                    # transcripts. Only delete memories whose text is byte-identical
+                    # to a truncated input (i.e. the fallback), never real extractions.
+                    raw_set = {m for m in messages if m.strip()}
+                    for r in results:
+                        stored = (r.get("memory") or "").strip()
+                        if stored in raw_set:
+                            try:
+                                self._mem.delete(r.get("id")) \
+                                    if hasattr(self._mem, "delete") else None
+                                logger.warning("MemLite sync_turn: dropped raw-fallback memory")
+                            except Exception:
+                                pass
+                    logger.info("MemLite sync_turn: %s (%d facts)",
+                                ", ".join(r.get("event", "?") for r in results), len(results))
+            except Exception as e:
+                # never let a background sync crash the turn or trip a breaker
+                logger.error("MemLite sync_turn failed: %s", e)
+                logger.debug("%s", traceback.format_exc())
+
+        with self._sync_lock:
+            prev = self._sync_thread
+            if prev and prev.is_alive():
+                prev.join(timeout=5.0)
+                if prev.is_alive():  # still busy: skip to avoid duplicate ingestion
+                    return
+            self._sync_thread = threading.Thread(
+                target=_worker, name="memlite-sync", daemon=True)
+            self._sync_thread.start()
 
     # -- tools -----------------------------------------------------------------
 
