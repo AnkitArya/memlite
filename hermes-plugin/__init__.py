@@ -23,18 +23,24 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from agent.memory_provider import MemoryProvider, RecallStatus
+    from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
     _HOST_AVAILABLE = True
 except ImportError:  # tests outside the hermes-agent cwd
     MemoryProvider = object
     RecallStatus = None
+    spawn_context_thread = None
+    _HOST_AVAILABLE = False
+
+try:
+    from agent.secret_scope import get_secret
+except ImportError:  # secret scope is optional for isolated unit tests
+    get_secret = None
 
 try:
     from .config_schema import DEFAULTS
@@ -156,8 +162,19 @@ _PURGE_SCHEMA = {
 
 
 def _expand(value: str) -> str:
-    """Expand ${VAR} templates in config values (env-based secrets)."""
-    return os.path.expandvars(value) if value else value
+    """Resolve a complete ${VAR} template through Hermes' scoped secret store."""
+    if not value or not isinstance(value, str):
+        return value
+    if value.startswith("${") and value.endswith("}") and get_secret is not None:
+        return get_secret(value[2:-1], "") or ""
+    return value
+
+
+def _scoped_secret(name: str) -> str:
+    """Read a profile-scoped secret; never fall back to the process environment."""
+    if get_secret is None:
+        return ""
+    return get_secret(name, "") or ""
 
 
 def _load_plugin_config() -> dict:
@@ -175,8 +192,8 @@ def _build_memory(config: dict, db_path: str):
 
     emb_key = (_expand(config.get("embedding_api_key"))
                or _expand(config.get("llm_api_key"))
-               or os.environ.get("DEEPINFRA_API_KEY")
-               or os.environ.get("OPENAI_API_KEY"))
+               or _scoped_secret("DEEPINFRA_API_KEY")
+               or _scoped_secret("OPENAI_API_KEY"))
     llm_key = _expand(config.get("llm_api_key")) or emb_key
 
     emb_cfg = {
@@ -205,12 +222,15 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     """MemoryProvider backed by the memlite engine."""
 
     def __init__(self, config: dict | None = None):
-        self._config = config if config is not None else _load_plugin_config()
+        self._config = dict(config) if config is not None else {}
+        self._config_explicit = config is not None
         self._mem = None
         self._session_id = ""
         self._agent_context = "primary"
         self._hermes_home = None
-        self._prefetch_cache: List[Dict[str, Any]] = []
+        self._prefetch_cache: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        self._prefetch_generation = 0
+        self._prefetch_thread: Optional[threading.Thread] = None
         self._last_prefetch_count: Optional[int] = None
         self._lock = threading.Lock()
         self._sync_lock = threading.Lock()
@@ -234,10 +254,15 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         try:
             import openai  # noqa: F401
             import sqlite_vec  # noqa: F401
-        except ImportError:
+            cfg = self._config if self._config_explicit else _load_plugin_config()
+            return bool(
+                _expand(cfg.get("embedding_api_key"))
+                or _expand(cfg.get("llm_api_key"))
+                or _scoped_secret("DEEPINFRA_API_KEY")
+                or _scoped_secret("OPENAI_API_KEY")
+            )
+        except Exception:
             return False
-        import os
-        return bool(os.environ.get("DEEPINFRA_API_KEY") or os.environ.get("OPENAI_API_KEY"))
 
     @property
     def unavailable_reason(self) -> str:
@@ -247,27 +272,49 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         except ImportError:
             return ("install: pip install 'memlite @ "
                     "git+https://github.com/AnkitArya/memlite.git' (openai + sqlite-vec)")
-        import os
-        if not (os.environ.get("DEEPINFRA_API_KEY") or os.environ.get("OPENAI_API_KEY")):
-            return ("set DEEPINFRA_API_KEY (or OPENAI_API_KEY) in ~/.hermes/.env — "
+        try:
+            cfg = self._config if self._config_explicit else _load_plugin_config()
+            configured = (
+                _expand(cfg.get("embedding_api_key"))
+                or _expand(cfg.get("llm_api_key"))
+                or _scoped_secret("DEEPINFRA_API_KEY")
+                or _scoped_secret("OPENAI_API_KEY")
+            )
+        except Exception:
+            configured = False
+        if not configured:
+            return ("set DEEPINFRA_API_KEY (or OPENAI_API_KEY) in the profile secret scope — "
                     "required for the extraction LLM and embeddings")
         return ""
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context") or "primary"
-        home = (kwargs.get("hermes_home")
-                or getattr(self, "_hermes_home", None)
-                or os.environ.get("HERMES_HOME"))
+        if not self._config_explicit:
+            self._config = _load_plugin_config()
+        self._sync_turn_enabled = bool(self._config.get("sync_turn_enabled", True))
+        self._sync_max_chars = int(self._config.get("sync_max_chars", 450) or 450)
+
+        home = kwargs.get("hermes_home")
         if home:
             self._hermes_home = Path(home)
         else:
-            # mirror hermes_constants resolution: profile-aware default
             try:
                 from hermes_constants import get_hermes_home
                 self._hermes_home = get_hermes_home()
             except Exception:
                 self._hermes_home = Path.home() / ".hermes"
+
+        # Reinitialization can happen after a session/process boundary. Close the
+        # previous handle and drain its workers before binding to the new profile/home.
+        if self._mem is not None:
+            self.shutdown()
+        self._closed = False
+        with self._lock:
+            self._prefetch_cache.clear()
+            self._prefetch_generation += 1
+            self._last_prefetch_count = None
+
         db_path = self._config.get("db_path") or str(self._hermes_home / "memlite.db")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._mem = _build_memory(self._config, db_path)
@@ -277,13 +324,10 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     # -- prefetch / sync -------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return the CACHED recall from the previous turn's queue_prefetch.
-
-        Strictly zero-latency: no network I/O here; insert after extraction.
-        """
+        """Consume the cached recall for this exact session/query pair."""
+        key = (session_id or self._session_id, query)
         with self._lock:
-            hits = self._prefetch_cache
-            self._prefetch_cache = []
+            hits = self._prefetch_cache.pop(key, [])
         lines = [f"- {h.get('memory', '')}" for h in hits if h.get("memory")]
         return ("<relevant_user_memories>\n" + "\n".join(lines)
                 + "\n</relevant_user_memories>\n") if lines else ""
@@ -293,30 +337,48 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
             count = self._last_prefetch_count
             self._last_prefetch_count = None
         if RecallStatus is not None and count:
-            return RecallStatus(count=count, source=self.name)
+            return RecallStatus(count=count, provider_label=self.name)
         return None
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Background hybrid search to pre-warm the NEXT turn."""
-        if self._closed or self._mem is None:
+        """Background hybrid search to pre-warm the next turn."""
+        if self._closed or self._mem is None or not query:
             return
+        sid = session_id or self._session_id
+        key = (sid, query)
+        mem = self._mem
+        with self._lock:
+            previous = self._prefetch_thread
+            if previous and previous.is_alive():
+                return
+            self._prefetch_generation += 1
+            generation = self._prefetch_generation
 
         def _worker():
             try:
-                hits = self._mem.search(
+                hits = mem.search(
                     query,
-                    filters={"user_id": self._user_scope()},
+                    filters={"user_id": self._user_scope(sid)},
                     top_k=int(self._config.get("top_k", 5)),
                     strategy="hybrid",
                 )
                 with self._lock:
-                    self._prefetch_cache = hits
-                    self._last_prefetch_count = len(hits)
+                    if (not self._closed
+                            and generation == self._prefetch_generation
+                            and self._session_id == sid):
+                        self._prefetch_cache[key] = hits
+                        self._last_prefetch_count = len(hits)
             except Exception as e:
                 logger.error("MemLite prefetch failed: %s", e)
                 logger.debug("%s", traceback.format_exc())
 
-        threading.Thread(target=_worker, name="memlite-worker", daemon=True).start()
+        if spawn_context_thread is None:
+            logger.error("MemLite cannot queue prefetch outside the Hermes runtime")
+            return
+        thread = spawn_context_thread(_worker, name="memlite-worker")
+        with self._lock:
+            self._prefetch_thread = thread
+        thread.start()
 
     # -- background per-turn capture (sync_turn) -----------------------------
     #
@@ -337,6 +399,9 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                   session_id: str = "") -> None:
         if self._closed or self._mem is None or not self._sync_turn_enabled:
             return
+        if spawn_context_thread is None:
+            logger.error("MemLite cannot sync outside the Hermes runtime")
+            return
 
         def _truncate(text: str, max_len: int) -> str:
             if not text or len(text) <= max_len:
@@ -347,9 +412,12 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 return window[:cut + 1]
             return window
 
+        mem = self._mem
+        uid = self._user_scope(session_id or self._session_id)
+        captured_session_id = session_id or self._session_id
+
         def _worker() -> None:
             try:
-                uid = self._user_scope()
                 messages = [
                     _truncate(user_content, self._sync_max_chars),
                     _truncate(assistant_content, self._sync_max_chars),
@@ -357,17 +425,14 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 messages = [m for m in messages if m.strip()]
                 if not messages:
                     return
-                result = self._mem.add(
+                result = mem.add(
                     messages, user_id=uid,
-                    metadata={"write_origin": "sync_turn", "session_id": session_id or self._session_id},
+                    metadata={"write_origin": "sync_turn", "session_id": captured_session_id},
                 )
                 results = result.get("results", []) if isinstance(result, dict) else []
                 if results:
-                    # Leak guard: if the extractor returned [] and the engine fell
-                    # back to storing a raw input message verbatim (issue #1 path),
-                    # drop it — the whole point of sync_turn is distilled FACTS, not
-                    # transcripts. Only delete memories whose text is byte-identical
-                    # to a truncated input (i.e. the fallback), never real extractions.
+                    # Leak guard: if extraction fell back to storing an input verbatim,
+                    # remove only that raw fallback, never a real extracted fact.
                     raw_set = {m for m in messages if m.strip()}
                     for r in results:
                         stored = (r.get("memory") or "").strip()
@@ -381,7 +446,7 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                     logger.info("MemLite sync_turn: %s (%d facts)",
                                 ", ".join(r.get("event", "?") for r in results), len(results))
             except Exception as e:
-                # never let a background sync crash the turn or trip a breaker
+                # Never let background sync crash the turn or trip a breaker.
                 logger.error("MemLite sync_turn failed: %s", e)
                 logger.debug("%s", traceback.format_exc())
 
@@ -391,8 +456,8 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 prev.join(timeout=5.0)
                 if prev.is_alive():  # still busy: skip to avoid duplicate ingestion
                     return
-            self._sync_thread = threading.Thread(
-                target=_worker, name="memlite-sync", daemon=True)
+            self._sync_thread = spawn_context_thread(
+                _worker, name="memlite-sync")
             self._sync_thread.start()
 
     # -- tools -----------------------------------------------------------------
@@ -421,12 +486,17 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         scope = {"user_id": self._user_scope()}
         try:
             if tool_name == "memlite_search":
-                hits = self._mem.search(
-                    args["query"],
-                    filters=scope,
-                    strategy=args.get("strategy", "hybrid"),
-                    top_k=int(args.get("top_k", 5)),
-                )
+                query = (args.get("query") or "").strip()
+                if not query:
+                    return json.dumps({"error": "query is required"})
+                try:
+                    top_k = max(1, min(int(args.get("top_k", 5)), 50))
+                except (TypeError, ValueError):
+                    top_k = 5
+                strategy = args.get("strategy", "hybrid")
+                if strategy not in {"hybrid", "semantic", "keyword"}:
+                    strategy = "hybrid"
+                hits = self._mem.search(query, filters=scope, strategy=strategy, top_k=top_k)
                 # strip embeddings (bloat) before returning to the model
                 slim = [{k: v for k, v in h.items() if k != "embedding"} for h in hits]
                 return json.dumps({"ok": True, "results": slim})
@@ -443,6 +513,8 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 mid = (args.get("memory_id") or "").strip()
                 if not mid:
                     return json.dumps({"error": "memory_id is required (see memlite_search)"})
+                if not self._owns_memory(mid, self._user_scope()):
+                    return json.dumps({"error": "memory_id is not owned by the active scope"})
                 r = self._mem.delete(mid)
                 ok = bool(r and r.get("results"))
                 return json.dumps({"ok": ok})
@@ -450,18 +522,27 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
                 mid = (args.get("memory_id") or "").strip()
                 if not mid:
                     return json.dumps({"error": "memory_id is required (see memlite_search)"})
-                hist = self._mem.history(mid, limit=int(args.get("limit", 50)))
+                if not self._owns_memory(mid, self._user_scope()):
+                    return json.dumps({"error": "memory_id is not owned by the active scope"})
+                try:
+                    limit = max(1, min(int(args.get("limit", 50)), 200))
+                except (TypeError, ValueError):
+                    limit = 50
+                hist = self._mem.history(mid, limit=limit)
                 return json.dumps({"ok": True, "memory_id": mid, "history": hist})
             if tool_name == "memlite_purge":
-                kwargs = {}
-                for k in ("user_id", "agent_id", "run_id"):
-                    v = args.get(k) or (self._user_scope() if k == "user_id" else None)
+                current_uid = self._user_scope()
+                requested_uid = args.get("user_id")
+                if requested_uid and str(requested_uid).strip() != current_uid:
+                    return json.dumps({"error": "cannot purge another user scope"})
+                purge_args = {}
+                for k in ("agent_id", "run_id"):
+                    v = args.get(k)
                     if v and str(v).strip():
-                        kwargs[k] = str(v).strip()
-                if "user_id" not in kwargs and "agent_id" not in kwargs and "run_id" not in kwargs:
-                    return json.dumps({"error": "memlite_purge needs at least one of user_id/agent_id/run_id"})
-                r = self._mem.delete_all(**kwargs)
-                return json.dumps({"ok": True, "deleted": r.get("deleted", 0), "scope": kwargs})
+                        purge_args[k] = str(v).strip()
+                purge_args["user_id"] = current_uid
+                r = self._mem.delete_all(**purge_args)
+                return json.dumps({"ok": True, "deleted": r.get("deleted", 0), "scope": purge_args})
             return json.dumps({"error": f"unknown tool {tool_name}"})
         except Exception as e:
             logger.error("MemLite tool call failed: %s", e)
@@ -532,21 +613,47 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
             return None
         return matched[0]["id"] if matched else None
 
+    def _owns_memory(self, memory_id: str, user_id: str) -> bool:
+        """Fail closed unless the memory belongs to the active user scope."""
+        try:
+            rows = self._mem.get_all(filters={"user_id": user_id}).get("results", [])
+            return any(str(row.get("id")) == str(memory_id) for row in rows)
+        except Exception:
+            logger.debug("MemLite ownership lookup failed", exc_info=True)
+            return False
+
     # -- session lifecycle ------------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        self.shutdown()
+        """Mark the session boundary without destroying the provider."""
+        with self._lock:
+            self._session_id = ""
+            self._prefetch_generation += 1
+            self._prefetch_cache.clear()
+            self._last_prefetch_count = None
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
-        self._session_id = new_session_id
+        with self._lock:
+            self._session_id = new_session_id
+            self._prefetch_generation += 1
+            self._prefetch_cache.clear()
+            self._last_prefetch_count = None
 
     def shutdown(self) -> None:
+        """Close the provider only during actual process/provider teardown."""
         self._closed = True
+        with self._lock:
+            self._prefetch_generation += 1
+            self._prefetch_cache.clear()
+            threads = [t for t in (self._prefetch_thread, self._sync_thread)
+                       if t is not None and t.is_alive()]
+        for thread in threads:
+            thread.join(timeout=5.0)
         if self._mem:
             try:
                 self._mem.close()
             except Exception:
-                pass
+                logger.debug("MemLite close failed", exc_info=True)
             self._mem = None
 
     # -- config ------------------------------------------------------------------
@@ -591,8 +698,8 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     # -- internal ------------------------------------------------------------------
 
-    def _user_scope(self) -> str:
-        return self._config.get("user_scope") or self._session_id or "default"
+    def _user_scope(self, session_id: str = "") -> str:
+        return self._config.get("user_scope") or session_id or self._session_id or "default"
 
 
 def register(ctx) -> None:
