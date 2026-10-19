@@ -98,12 +98,27 @@ _STOPWORDS = {
 # Phrases that signal an explicit retraction (DELETE intent). Anchored to word
 # boundaries so "not my favorite" still matches but "don't forget" (positive)
 # or "forgettable" do not.
-_RETRACT_RE = re.compile(
-    r"\b(forget|forgot|remove|delete|erase|drop|retract|scrap|never (?:liked|said|did|meant)|"
+_RETRACT_ALT = (
+    r"forget|forgot|remove|delete|erase|drop|retract|scrap|never (?:liked|said|did|meant)|"
     r"don'?t (?:like|want|need|use)|no longer|i (?:was )?wrong about|change my mind about|"
-    r"ignore what i (?:said|wrote))\b",
-    re.IGNORECASE,
+    r"ignore what i (?:said|wrote)"
 )
+_RETRACT_RE = re.compile(r"\b(?:" + _RETRACT_ALT + r")\b", re.IGNORECASE)
+
+# ANCHORED retraction gate: the phrase must OPEN the text/sentence (polite
+# wrappers and discourse markers allowed). A retraction word buried inside a
+# substantive statement must not classify the whole text as a retraction —
+# that misclassification loses data (the best-matching memory is deleted and
+# the new fact is consumed, never stored; observed 2026-10-19 on a long
+# decommission fact ending "...; delete the rescue file only after absorbing.").
+_RETRACT_LEADIN = r"(?:(?:please|kindly|also|actually|ok(?:ay)?|hey|just|and|but|so|i)\s+)*"
+_RETRACT_ANCHOR_RE = re.compile(
+    r"^\s*" + _RETRACT_LEADIN + r"(\b(?:" + _RETRACT_ALT + r")\b)", re.IGNORECASE
+)
+# A retraction is a short directive. Longer statements are NEW FACTS even when
+# they contain a retraction word (a missed DELETE is a harmless duplicate; a
+# wrong DELETE is data loss).
+_RETRACT_MAX_CONTENT_TOKENS = 20
 
 
 def _content_token_list(text: str) -> list[str]:
@@ -130,13 +145,21 @@ def _shared_bigrams(a: str, b: str) -> set[str]:
 
 
 def _is_retraction(text: str) -> bool:
-    m = _RETRACT_RE.search(text)
+    # Size guard: retractions are short directives ("forget X"). A long
+    # substantive statement that merely CONTAINS a retraction word is a new
+    # fact, not a retraction (data-loss guard — see _RETRACT_ANCHOR_RE note).
+    if len(_content_token_list(text)) > _RETRACT_MAX_CONTENT_TOKENS:
+        return False
+    # Anchor guard: the phrase must open the text/sentence (polite/discourse
+    # lead-ins allowed): "Please forget that I ...", "I never liked ..." yes;
+    # "...the repo was deleted..." / "...we remove stale files" no.
+    m = _RETRACT_ANCHOR_RE.search(text)
     if m is None:
         return False
     # "don't/didn't forget ..." is a reminder (positive intent), not a retraction:
-    # if the matched token is forget/forgot and it is negated, keep it.
-    if m.group(0).lower() in ("forget", "forgot"):
-        prefix = text[: m.start()].lower()
+    # if the matched phrase is forget/forgot and it is negated, keep it.
+    if m.group(1).lower() in ("forget", "forgot"):
+        prefix = text[: m.start(1)].lower()
         if re.search(r"\b(?:don'?t|do not|didn'?t|did not|never)\s+$", prefix):
             return False
     return True

@@ -108,3 +108,34 @@ if __name__ == "__main__":
             fn()
             print(f"PASS  {name}")
     print("\nALL DETERMINISTIC RECONCILE UNIT TESTS PASSED")
+
+
+def test_long_factual_statement_with_retract_word_is_not_retraction():
+    # Data-loss guard (2026-10-19): a long substantive fact that merely CONTAINS
+    # a retraction word used to be classified as a retraction — the best-matching
+    # existing memory was deleted AND the new fact was consumed, never stored.
+    long_fact = (
+        "india-trade-cli was fully decommissioned 2026-10-19: the repo checkout was "
+        "deleted after trading-debby cut over to its own venv (analyzer installed from "
+        "the pinned wheel). Its .env creds were rescued to a 600-perm rescue file; "
+        "delete the rescue file only after absorbing it into the repos' .env files."
+    )
+    assert not _is_retraction(long_fact)
+    op = D(long_fact, None, [_cand(
+        "User's trading-debby project venv build failed due to a jmespath pin conflict",
+        0.78)])
+    assert op["event"] in ("ADD", "UPDATE"), op
+
+
+def test_midsentence_retract_word_is_not_retraction():
+    assert not _is_retraction("User will delete the old logs directory tomorrow")
+    assert not _is_retraction("the repo was deleted after the cutover")
+    assert not _is_retraction("This note documents how we remove stale index files")
+
+
+def test_anchored_retraction_forms_still_detected():
+    assert _is_retraction("I never liked spinach")
+    assert _is_retraction("Please forget that I said I love pineapple on pizza")
+    assert _is_retraction("no longer prefer dark mode")
+    assert _is_retraction("remove the thing about coffee")
+    assert not _is_retraction("don't forget to buy milk")
