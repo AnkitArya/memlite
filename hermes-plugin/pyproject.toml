@@ -1,0 +1,15 @@
+[project]
+name = "hermes-plugin-memlite"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+  "openai",
+  "sqlite-vec",
+  "memlite",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+memlite = { git = "https://github.com/AnkitArya/memlite.git", rev = "b1a612c71824903667bffa283fcf10a2701a37e7" }
