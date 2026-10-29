@@ -19,6 +19,9 @@ DEFAULTS = {
     # leak that led to it being pulled in the first place (memlite issue #1).
     "sync_turn_enabled": True,
     "sync_max_chars": 450,
+    # Capture the user's side of the turn only (see sync_turn): assistant
+    # narration becomes stale "facts" once the extractor rewrites "I" as "User".
+    "sync_include_assistant": False,
 }
 
 SCHEMA = {
@@ -91,6 +94,16 @@ SCHEMA = {
             "maximum": 8192,
             "help": "Max characters of each side of a turn fed to sync_turn extraction "
                    "(truncated at a sentence boundary). Lower = less scratch noise.",
+        },
+        {
+            "key": "sync_include_assistant",
+            "label": "Also extract the assistant's side of the turn",
+            "type": "boolean",
+            "default": DEFAULTS["sync_include_assistant"],
+            "help": "Off by default. The extractor rewrites \"I/my\" as \"User\", so "
+                   "assistant narration lands as stale pseudo-facts (\"User opened "
+                   "PR #35\", \"run completed with exit code 0\"). Enable only if you "
+                   "want assistant-side detail captured.",
         },
     ],
 }

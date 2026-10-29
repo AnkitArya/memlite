@@ -7,6 +7,7 @@ Design notes (lean on purpose):
   - `search` uses semantic (sqlite-vec) by default; pass strategy="hybrid" to fuse
     vector + FTS5 keyword scores.
 """
+import logging
 import os
 import re
 import time
@@ -14,6 +15,8 @@ import uuid
 
 from .embedder import Embedder
 from .store import Store
+
+logger = logging.getLogger(__name__)
 
 # Recency weighting for hybrid search:
 # score = rrf_score * (RECENCY_BASE + (1-RECENCY_BASE) * decay), where decay
@@ -46,8 +49,13 @@ Conversation:
 
 Rules:
 - Extract ONLY facts worth remembering long-term (preferences, personal
-  details, decisions, skills, important events). Ignore small talk, questions,
-  transient states, and assistant filler.
+  details, decisions, skills, relationships, environment setup). Ignore small
+  talk, questions, transient states, and assistant filler.
+- A fact qualifies only if it will still be true in six months. Do NOT store
+  status, progress or event reports: pull/PR/issue numbers, commit SHAs, branch
+  names, process ids, exit codes, durations, file/test counts, or "opened",
+  "merged", "deployed", "shipped", "fixed", "ran", "completed" narration.
+  Those go stale within a day and must be skipped.
 - Each memory must be a short, self-contained statement. Rewrite "I/my" as
   "User". Never invent facts not present in the conversation.
 - For each fact, add "aliases": 2-4 retrieval terms that are CLOSELY RELATED
@@ -268,26 +276,34 @@ class Memory:
             reclaimed += retracted_clauses
             normal += other
         extracted = self._extract(normal) if normal else []
-        extracted = [{"text": t, "aliases": None} for t in reclaimed] + extracted
-        if not extracted:
-            # nothing extracted and nothing was a retraction: treat raw text as
-            # the fact rather than silently dropping the add
+        retracted = [{"text": t, "aliases": None} for t in reclaimed]
+        if extracted is None:
+            # Extraction was UNAVAILABLE or failed (no LLM configured, API error,
+            # unparseable reply): keep the raw text rather than silently dropping
+            # the write. An empty LIST is a different signal — the model answered
+            # and found nothing worth remembering — so it must NOT resurrect the
+            # raw input, which is how status narration ("opened PR #35", "run
+            # completed with exit code 0") used to land in the store.
             extracted = [{"text": t, "aliases": None} for t in texts]
+        else:
+            extracted = retracted + extracted
 
         return self._deterministic_reconcile(
             extracted, user_id=user_id, agent_id=agent_id, run_id=run_id,
             metadata=metadata, retention=self.retention,
         )
 
-    def _extract(self, texts: list[str]) -> list[dict]:
+    def _extract(self, texts: list[str]) -> list[dict] | None:
         """LLM extraction pass: distill a conversation into discrete memories.
 
-        Returns a list of dicts: {"text": ..., "aliases": [...]}. Returns []
-        if no LLM or the call fails (callers fall back to raw
-        dedupe-by-heuristic — never drop data).
+        Returns a list of {"text": ..., "aliases": [...]} — possibly EMPTY, which
+        means "the model answered and nothing is worth remembering". Returns
+        None when extraction could not run at all (no LLM configured, call
+        failed, unparseable reply); callers fall back to the raw text so a
+        transient failure never loses data.
         """
         if self._llm_client is None:
-            return []
+            return None
         convo = "\n".join(f"user says: {t}" for t in texts)
         prompt = _EXTRACT_PROMPT.format(conversation=convo)
         try:
@@ -300,7 +316,7 @@ class Memory:
             # tolerate markdown fences / prose around the JSON block
             m = re.search(r"\{.*\}", r.choices[0].message.content, re.S)
             if not m:
-                return []
+                return None
             val = json.loads(m.group(0))
             raw = val.get("memories", []) if isinstance(val, dict) else []
             # v1 format: ["fact", ...] (plain strings) — treated as aliasless
@@ -322,7 +338,7 @@ class Memory:
                     })
             return out
         except Exception:
-            return []
+            return None
 
     def _deterministic_reconcile(self, facts, *, user_id, agent_id, run_id, metadata,
                                  retention: str = "all"):
@@ -570,7 +586,15 @@ class Memory:
         # standard way to merge top-k lists from different scorers (bm25 rank
         # and cosine similarity are not directly comparable; raw positions are).
         sem = store.semantic_search(qv, top_k=top_k * 2, filters=filters)
-        kw = store.keyword_search(query, top_k=top_k * 2, filters=filters)
+        try:
+            kw = store.keyword_search(query, top_k=top_k * 2, filters=filters)
+        except Exception as e:
+            # A broken keyword leg must not void recall. Live failure: one
+            # unparseable FTS5 query (a quoted path) raised *after* the semantic
+            # rows were computed, so the whole hybrid call failed and prefetch
+            # returned an empty block. Semantic-only is a fine answer.
+            logger.warning("keyword leg failed (%s) — returning semantic-only", e)
+            kw = []
         K = 60
         rrf: dict[str, dict] = {}  # id -> shaped row with rrf_score
         for rank, r in enumerate(sem):

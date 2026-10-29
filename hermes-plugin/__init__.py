@@ -60,6 +60,9 @@ except ImportError:  # loaded as a flat package shell without config_schema
         # truncation + durable-fact extraction guard against the working-note leak.
         "sync_turn_enabled": True,
         "sync_max_chars": 450,
+        # Capture the user's side only; assistant narration becomes stale
+        # "facts" once the extractor rewrites "I" as "User".
+        "sync_include_assistant": False,
     }
 
 logger = logging.getLogger(__name__)
@@ -237,6 +240,12 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
         self._sync_thread: Optional[threading.Thread] = None
         self._sync_turn_enabled = bool(self._config.get("sync_turn_enabled", True))
         self._sync_max_chars = int(self._config.get("sync_max_chars", 450) or 450)
+        # Capture the user's side only by default: the extractor rewrites "I/my"
+        # as "User", so feeding assistant narration turns status reports into
+        # third-person "facts" ("User opened PR #35 ...", "User's run completed
+        # with exit code 0"). Durable preferences live on the user side.
+        self._sync_include_assistant = bool(
+            self._config.get("sync_include_assistant", False))
         self._closed = False
 
     # -- ABC surface -----------------------------------------------------------
@@ -294,6 +303,8 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
             self._config = _load_plugin_config()
         self._sync_turn_enabled = bool(self._config.get("sync_turn_enabled", True))
         self._sync_max_chars = int(self._config.get("sync_max_chars", 450) or 450)
+        self._sync_include_assistant = bool(
+            self._config.get("sync_include_assistant", False))
 
         home = kwargs.get("hermes_home")
         if home:
@@ -388,10 +399,14 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
     # facts. Re-enabled with mem0-derived safeguards that fix that leak:
     #   1) each message is truncated at a sentence boundary to `sync_max_chars`
     #      (default 450), so long scratch/analysis dumps never reach the LLM;
-    #   2) extraction still goes through the engine's durable-fact pass
+    #   2) only the USER side of the turn is captured unless
+    #      `sync_include_assistant` is enabled — assistant narration is the
+    #      source of the "User opened PR #N / completed with exit code 0" class
+    #      of stale pseudo-facts;
+    #   3) extraction still goes through the engine's durable-fact pass
     #      (`add()` → `_extract`), which distills discrete facts and runs
     #      deterministic ADD/UPDATE/DELETE reconcile (no duplicated rows);
-    #   3) it runs on a background thread with a join-guard so it never blocks
+    #   4) it runs on a background thread with a join-guard so it never blocks
     #      the turn and never double-ingests a slow previous sync.
     # Gated on config `plugins.memlite.sync_turn_enabled` (default true).
 
@@ -418,10 +433,9 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
         def _worker() -> None:
             try:
-                messages = [
-                    _truncate(user_content, self._sync_max_chars),
-                    _truncate(assistant_content, self._sync_max_chars),
-                ]
+                messages = [_truncate(user_content, self._sync_max_chars)]
+                if self._sync_include_assistant:
+                    messages.append(_truncate(assistant_content, self._sync_max_chars))
                 messages = [m for m in messages if m.strip()]
                 if not messages:
                     return
@@ -467,8 +481,10 @@ class MemLiteProvider(MemoryProvider):  # type: ignore[misc,valid-type]
 
     def system_prompt_block(self) -> str:
         """STATIC system-prompt text telling the agent to proactively recall and
-        store memories (mirrors mem0's _PROMPT_BODY). The model drives all writes
-        explicitly via memlite_add (no background sync_turn)."""
+        store memories (mirrors mem0's _PROMPT_BODY). Recall covers both the
+        injected prefetch block and explicit `memlite_search`; writes reach the
+        store either explicitly (`memlite_add`, mirrored `memory`-tool writes) or
+        silently from the user side of each turn (see `sync_turn`)."""
         return f"# MemLite Memory\nActive.\n{_PROMPT_BODY}"
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
