@@ -6,6 +6,7 @@ Tables (all in ONE db file, share a connection/WAL):
   memories_fts      FTS5 keyword index (fallback when vector recall misses)
 """
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -53,6 +54,22 @@ _SCHEMA_FTS = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
 USING fts5(id UNINDEXED, memory, aliases);
 """
+
+# FTS5 string literals are double-quoted, and a raw user query routinely contains
+# quotes (people quote paths, error strings, tickers). An embedded quote closes
+# the literal early, so the remainder is parsed as query syntax and SQLite raises
+# `fts5: syntax error near "/"` — which used to abort the whole hybrid recall.
+# Strip quotes before quoting; `-`/`_` are normalised to spaces as well because
+# the unicode61 tokenizer does not split on them, so `india-trade-cli` has to be
+# searched as three tokens.
+_FTS_UNQUOTED = re.compile(r'["\u201c\u201d]')
+
+
+def _fts_match_expr(query: str) -> str:
+    """Build an OR-of-quoted-phrases FTS5 expression from free user text."""
+    cleaned = _FTS_UNQUOTED.sub(" ", query or "")
+    terms = [t for t in cleaned.replace("-", " ").replace("_", " ").split() if t]
+    return " OR ".join(f'"{t}"' for t in terms)
 
 # Append-only audit trail ported from mem0's history (memory/storage.py). Every
 # ADD / UPDATE / DELETE on a memory writes one row here, so a value that was
@@ -381,10 +398,9 @@ class Store:
 
     def keyword_search(self, query: str, top_k: int = 5, filters: dict | None = None) -> list[dict]:
         """FTS5 (BM25-ish) fallback over text + aliases corpus."""
-        terms = [t for t in query.replace("-", " ").replace("_", " ").split() if t]
-        if not terms:
+        match_expr = _fts_match_expr(query)
+        if not match_expr:
             return []
-        match_expr = " OR ".join(f'"{t}"' for t in terms)
         sql = """
             SELECT m.mem_id AS id, fts.rank AS score,
                    m.memory, m.user_id, m.agent_id, m.run_id, m.metadata,
